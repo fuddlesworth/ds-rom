@@ -46,6 +46,8 @@ pub enum AutoloadKind {
     Dtcm,
     /// Other autoload block of unknown purpose.
     Unknown(u32),
+    /// Autoload block of the ARM9i program in DSi-enhanced and DSi-exclusive titles, only loaded in DSi mode.
+    Ltd(u32),
 }
 
 impl PartialOrd for AutoloadKind {
@@ -56,7 +58,7 @@ impl PartialOrd for AutoloadKind {
 
 impl Ord for AutoloadKind {
     fn cmp(&self, other: &Self) -> Ordering {
-        // ITCM < DTCM < Unknown
+        // ITCM < DTCM < Unknown < Ltd
         match (self, other) {
             (_, _) if self == other => Ordering::Equal,
             (AutoloadKind::Itcm, _) => Ordering::Less,
@@ -64,6 +66,9 @@ impl Ord for AutoloadKind {
             (AutoloadKind::Dtcm, _) => Ordering::Less,
             (_, AutoloadKind::Dtcm) => Ordering::Greater,
             (AutoloadKind::Unknown(a), AutoloadKind::Unknown(b)) => a.cmp(b),
+            (AutoloadKind::Unknown(_), AutoloadKind::Ltd(_)) => Ordering::Less,
+            (AutoloadKind::Ltd(_), AutoloadKind::Unknown(_)) => Ordering::Greater,
+            (AutoloadKind::Ltd(a), AutoloadKind::Ltd(b)) => a.cmp(b),
         }
     }
 }
@@ -238,6 +243,7 @@ impl Display for AutoloadKind {
             AutoloadKind::Itcm => write!(f, "ITCM"),
             AutoloadKind::Dtcm => write!(f, "DTCM"),
             AutoloadKind::Unknown(index) => write!(f, "Unknown({index})"),
+            AutoloadKind::Ltd(index) => write!(f, "Ltd({index})"),
         }
     }
 }

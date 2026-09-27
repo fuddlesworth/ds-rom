@@ -10,7 +10,7 @@ use snafu::Snafu;
 
 use super::{
     Arm7, Arm9, Arm9AutoloadError, Arm9Error, Arm9HmacSha1KeyError, Arm9Offsets, Arm9OverlaySignaturesError, Autoload, Banner,
-    BannerError, BannerImageError, BuildInfo, Dsi, DsiConfig, DsiError, DsiHeaderValues, FileBuildError, FileParseError,
+    BannerError, BannerImageError, BuildInfo, Dsi, DsiConfig, DsiError, DsiHeaderValues, FileBuildError, FileParseError, Ltd,
     FileSystem, Header, HeaderBuildError, Logo, LogoError, LogoLoadError, LogoSaveError, Overlay, OverlayError, OverlayInfo,
     OverlayOptions, OverlayTable, RomConfigAutoload, RomConfigUnknownAutoload,
     raw::{
@@ -207,6 +207,12 @@ pub enum RomBuildError {
 /// Errors related to [`Rom::save`] and [`Rom::load`].
 #[derive(Snafu, Debug)]
 pub enum RomSaveError {
+    /// See [`DsiError`].
+    #[snafu(transparent)]
+    Dsi {
+        /// Source error.
+        source: DsiError,
+    },
     /// Occurs when the ROM is encrypted but no Blowfish key was provided.
     #[snafu(display("blowfish key is required because ARM9 program is encrypted"))]
     BlowfishKeyNeeded,
@@ -437,6 +443,29 @@ impl<'a> Rom<'a> {
             Default::default()
         };
 
+        // --------------------- Load DSi-specific parts ---------------------
+        // Loaded before the ARM9 program, which holds the parameters of the ARM9i program's LTD module
+        let (dsi, ltd_params) = if let Some(dsi_config) = &config.dsi {
+            let dsi_config_data: DsiConfig = serde_saphyr::from_reader(open_file(path.join(&dsi_config.config))?)?;
+            let arm9i = read_file(path.join(&dsi_config.arm9i))?;
+            let arm7i = read_file(path.join(&dsi_config.arm7i))?;
+            let region_prefix = read_file(path.join(&dsi_config.region_prefix))?;
+            if dsi_config_data.ltd.is_some() {
+                let mut autoloads = vec![];
+                for files in &dsi_config.ltd_autoloads {
+                    let data = read_file(path.join(&files.files.bin))?;
+                    let info = serde_saphyr::from_reader(open_file(path.join(&files.files.config))?)?;
+                    autoloads.push(Autoload::new(data, info));
+                }
+                let (dsi, params) = Dsi::with_ltd(Ltd::new(arm9i, autoloads), arm7i, region_prefix, dsi_config_data)?;
+                (Some(dsi), Some(params))
+            } else {
+                (Some(Dsi::new(arm9i, arm7i, region_prefix, dsi_config_data)), None)
+            }
+        } else {
+            (None, None)
+        };
+
         // --------------------- Build ARM9 program ---------------------
         let mut arm9 = Arm9::with_autoloads(
             arm9,
@@ -449,6 +478,9 @@ impl<'a> Rom<'a> {
             },
         )?;
         arm9_build_config.build_info.assign_to_raw(arm9.build_info_mut()?);
+        if let (Some(dsi), Some(params)) = (&dsi, &ltd_params) {
+            arm9.write_ltd_params(dsi.config().arm9i.build_info, params);
+        }
         arm9.update_overlay_signatures(&arm9_overlays)?;
         if arm9.dsprot_state().is_unencrypted() && options.encrypt {
             log::info!("Encrypting DS Protect in ARM9 program");
@@ -504,17 +536,6 @@ impl<'a> Rom<'a> {
         // --------------------- Load multiboot signature ---------------------
         let multiboot_signature = if let Some(multiboot_signature) = config.multiboot_signature.as_ref() {
             serde_saphyr::from_reader(open_file(path.join(multiboot_signature))?)?
-        } else {
-            None
-        };
-
-        // --------------------- Load DSi-specific parts ---------------------
-        let dsi = if let Some(dsi_config) = &config.dsi {
-            let dsi_config_data: DsiConfig = serde_saphyr::from_reader(open_file(path.join(&dsi_config.config))?)?;
-            let arm9i = read_file(path.join(&dsi_config.arm9i))?;
-            let arm7i = read_file(path.join(&dsi_config.arm7i))?;
-            let region_prefix = read_file(path.join(&dsi_config.region_prefix))?;
-            Some(Dsi::new(arm9i, arm7i, region_prefix, dsi_config_data))
         } else {
             None
         };
@@ -656,6 +677,8 @@ impl<'a> Rom<'a> {
             let (bin_path, config_path) = match autoload.kind() {
                 raw::AutoloadKind::Itcm => (path.join(&self.config.itcm.bin), path.join(&self.config.itcm.config)),
                 raw::AutoloadKind::Dtcm => (path.join(&self.config.dtcm.bin), path.join(&self.config.dtcm.config)),
+                // LTD autoloads belong to the ARM9i program, not the ARM9 program
+                raw::AutoloadKind::Ltd(index) => return AutoloadNotFoundSnafu { index }.fail(),
                 raw::AutoloadKind::Unknown(index) => {
                     let unknown_autoload = self
                         .config
@@ -725,7 +748,15 @@ impl<'a> Rom<'a> {
         // --------------------- Save DSi-specific parts ---------------------
         if let (Some(dsi), Some(dsi_config)) = (&self.dsi, &self.config.dsi) {
             serde_saphyr::to_io_writer(&mut create_file_and_dirs(path.join(&dsi_config.config))?, dsi.config())?;
-            create_file_and_dirs(path.join(&dsi_config.arm9i))?.write_all(dsi.arm9i())?;
+            if let Some(ltd) = dsi.ltd() {
+                create_file_and_dirs(path.join(&dsi_config.arm9i))?.write_all(ltd.static_data())?;
+                for (autoload, files) in ltd.autoloads().iter().zip(&dsi_config.ltd_autoloads) {
+                    create_file_and_dirs(path.join(&files.files.bin))?.write_all(autoload.full_data())?;
+                    serde_saphyr::to_io_writer(&mut create_file_and_dirs(path.join(&files.files.config))?, autoload.info())?;
+                }
+            } else {
+                create_file_and_dirs(path.join(&dsi_config.arm9i))?.write_all(dsi.arm9i())?;
+            }
             create_file_and_dirs(path.join(&dsi_config.arm7i))?.write_all(dsi.arm7i())?;
             create_file_and_dirs(path.join(&dsi_config.region_prefix))?.write_all(dsi.region_prefix())?;
         }
@@ -866,11 +897,25 @@ impl<'a> Rom<'a> {
             },
             arm9_hmac_sha1_key: has_arm9_hmac_sha1.then_some("arm9/hmac_sha1_key.bin".into()),
             arm9_footer,
-            dsi: dsi.is_some().then(|| RomConfigDsi {
+            dsi: dsi.as_ref().map(|dsi| RomConfigDsi {
                 config: "dsi/dsi.yaml".into(),
                 arm9i: "dsi/arm9i.bin".into(),
                 arm7i: "dsi/arm7i.bin".into(),
                 region_prefix: "dsi/region_prefix.bin".into(),
+                ltd_autoloads: dsi
+                    .ltd()
+                    .map(|ltd| {
+                        (0..ltd.autoloads().len() as u32)
+                            .map(|index| RomConfigUnknownAutoload {
+                                index,
+                                files: RomConfigAutoload {
+                                    bin: format!("dsi/ltd_autoload_{index}.bin").into(),
+                                    config: format!("dsi/ltd_autoload_{index}.yaml").into(),
+                                },
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
             }),
             alignment,
             padding,

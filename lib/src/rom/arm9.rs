@@ -293,6 +293,14 @@ impl<'a> Arm9<'a> {
         Ok(arm9)
     }
 
+    /// Writes the LTD module parameters of a DSi-enhanced or DSi-exclusive title at the given offset, see
+    /// [`super::Dsi::with_ltd`].
+    pub fn write_ltd_params(&mut self, offset: u32, params: &super::LtdModuleParams) {
+        let start = offset as usize;
+        let bytes = bytemuck::bytes_of(params);
+        self.data.to_mut()[start..start + bytes.len()].copy_from_slice(bytes);
+    }
+
     /// Returns whether the secure area is encrypted. See [`Self::originally_encrypted`] for whether the secure area was
     /// encrypted originally.
     pub fn is_encrypted(&self) -> bool {

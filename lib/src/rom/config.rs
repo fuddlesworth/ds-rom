@@ -146,6 +146,10 @@ pub struct RomConfigDsi {
     pub arm7i: PathBuf,
     /// Path to the data between the start of the DSi region and the ARM9i program.
     pub region_prefix: PathBuf,
+    /// Paths to the autoload blocks of the ARM9i program's LTD module, see [`crate::rom::Ltd`]. If present, the ARM9i
+    /// path holds the decompressed data before the autoload blocks instead of the whole program.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ltd_autoloads: Vec<RomConfigUnknownAutoload>,
 }
 
 fn default_true() -> bool {

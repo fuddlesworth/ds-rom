@@ -3,6 +3,7 @@ use std::borrow::Cow;
 use super::raw::{AutoloadInfo, AutoloadKind};
 
 /// An autoload block.
+#[derive(Clone)]
 pub struct Autoload<'a> {
     data: Cow<'a, [u8]>,
     info: AutoloadInfo,

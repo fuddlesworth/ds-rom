@@ -1,13 +1,23 @@
-use std::{borrow::Cow, ops::Range};
+use std::{borrow::Cow, io, mem::size_of, ops::Range};
 
+use bytemuck::{Pod, Zeroable};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 use snafu::{Backtrace, Snafu};
 
 use super::{
-    Arm9,
-    raw::{self, ProgramOffset, RawHeaderError, TableOffset},
+    Arm9, Autoload,
+    raw::{self, AutoloadInfo, AutoloadKind, ProgramOffset, RawHeaderError, TableOffset, TwlAutoloadInfoEntry},
 };
-use crate::crypto::{blowfish::BlowfishKey, hmac_sha1::HmacSha1, modcrypt::Modcrypt};
+use crate::{
+    compress::lz77::{Lz77, Lz77DecompressError},
+    crypto::{blowfish::BlowfishKey, hmac_sha1::HmacSha1, modcrypt::Modcrypt},
+};
+
+/// Marks the end of [`LtdModuleParams`].
+const LTD_NITROCODE: u32 = 0xdec01463;
+/// The ARM9 program is compressed from this offset, so [`LtdModuleParams`] must be stored before it.
+const ARM9_COMPRESSION_START: u32 = 0x4000;
+const LZ77: Lz77 = Lz77 {};
 
 /// Size of the part of the ARM9 secure area which is encrypted on the cartridge.
 const SECURE_AREA_ENCRYPTED_SIZE: u32 = 0x800;
@@ -26,9 +36,41 @@ type Digest = [u8; DIGEST_SIZE];
 #[derive(Clone)]
 pub struct Dsi<'a> {
     arm9i: Cow<'a, [u8]>,
+    ltd: Option<Ltd<'a>>,
     arm7i: Cow<'a, [u8]>,
     region_prefix: Cow<'a, [u8]>,
     config: DsiConfig,
+}
+
+/// The ARM9i program split into its parts. The ARM9i program holds the LTD ("limited") module, which is autoloaded
+/// only in DSi mode.
+#[derive(Clone)]
+pub struct Ltd<'a> {
+    static_data: Cow<'a, [u8]>,
+    autoloads: Vec<Autoload<'a>>,
+}
+
+/// Parameters of the LTD module, stored in the ARM9 program at the header's ARM9i build info offset.
+#[repr(C)]
+#[derive(Clone, Copy, Zeroable, Pod, Debug, PartialEq, Eq)]
+pub struct LtdModuleParams {
+    /// Address of the autoload list.
+    pub autoload_list_start: u32,
+    /// End address of the autoload list.
+    pub autoload_list_end: u32,
+    /// Address of the first autoload block.
+    pub autoload_start: u32,
+    /// End address of the compressed ARM9i program, or zero if it is not compressed.
+    pub compressed_static_end: u32,
+    nitrocode: u32,
+    nitrocode_rev: u32,
+}
+
+/// Configuration of the LTD module, see [`Ltd`].
+#[derive(Serialize, Deserialize, Clone, Copy)]
+pub struct LtdConfig {
+    /// Whether the ARM9i program is compressed.
+    pub compressed: bool,
 }
 
 /// Configuration of the DSi-specific parts of a ROM, see [`Dsi`].
@@ -45,6 +87,9 @@ pub struct DsiConfig {
     /// Values derived from the encrypted secure area. See [`SecureAreaValues`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secure_area: Option<SecureAreaValues>,
+    /// Present if the ARM9i program is split into the parts of its LTD module, see [`Ltd`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ltd: Option<LtdConfig>,
 }
 
 /// A DSi-specific program, ARM9i or ARM7i.
@@ -119,6 +164,18 @@ pub enum DsiError {
         /// Backtrace to the source of the error.
         backtrace: Backtrace,
     },
+    /// See [`Lz77DecompressError`].
+    #[snafu(transparent)]
+    Lz77Decompress {
+        /// Source error.
+        source: Lz77DecompressError,
+    },
+    /// See [`io::Error`].
+    #[snafu(transparent)]
+    Io {
+        /// Source error.
+        source: io::Error,
+    },
     /// Occurs when the stored secure area digests don't cover the secure area.
     #[snafu(display("expected {expected} secure area sector digests but got {actual}:\n{backtrace}"))]
     WrongSecureAreaDigestCount {
@@ -184,7 +241,46 @@ pub struct DsiHeaderValues {
 impl<'a> Dsi<'a> {
     /// Creates a new [`Dsi`] from decrypted programs.
     pub fn new<T: Into<Cow<'a, [u8]>>>(arm9i: T, arm7i: T, region_prefix: T, config: DsiConfig) -> Self {
-        Self { arm9i: arm9i.into(), arm7i: arm7i.into(), region_prefix: region_prefix.into(), config }
+        Self { arm9i: arm9i.into(), ltd: None, arm7i: arm7i.into(), region_prefix: region_prefix.into(), config }
+    }
+
+    /// Creates a new [`Dsi`] from the parts of the ARM9i program's LTD module. Returns the LTD module parameters to write
+    /// into the ARM9 program with [`Arm9::write_ltd_params`].
+    ///
+    /// # Errors
+    ///
+    /// This function will return an error if compressing the ARM9i program fails.
+    pub fn with_ltd<T: Into<Cow<'a, [u8]>>>(
+        ltd: Ltd<'a>,
+        arm7i: T,
+        region_prefix: T,
+        config: DsiConfig,
+    ) -> Result<(Self, LtdModuleParams), DsiError> {
+        let base = config.arm9i.base_address;
+        let compressed = config.ltd.is_some_and(|ltd| ltd.compressed);
+
+        let mut image = ltd.static_data.to_vec();
+        let autoload_start = base + image.len() as u32;
+        for autoload in &ltd.autoloads {
+            image.extend(autoload.full_data());
+        }
+        let autoload_list_start = base + image.len() as u32;
+        for autoload in &ltd.autoloads {
+            image.extend(autoload.info().entry_bytes());
+        }
+        let autoload_list_end = base + image.len() as u32;
+
+        let arm9i = if compressed { LZ77.compress(&image, 0)?.into_vec() } else { image };
+        let params = LtdModuleParams {
+            autoload_list_start,
+            autoload_list_end,
+            autoload_start,
+            compressed_static_end: if compressed { base + arm9i.len() as u32 } else { 0 },
+            nitrocode: LTD_NITROCODE,
+            nitrocode_rev: LTD_NITROCODE.swap_bytes(),
+        };
+        let dsi = Self { arm9i: arm9i.into(), ltd: Some(ltd), arm7i: arm7i.into(), region_prefix: region_prefix.into(), config };
+        Ok((dsi, params))
     }
 
     /// Extracts the DSi-specific parts of a raw ROM, or returns `None` if the ROM is not DSi-enhanced or DSi-exclusive.
@@ -222,6 +318,15 @@ impl<'a> Dsi<'a> {
         let dsi_region_start = header.dsi_rom_region_end as usize * DSI_REGION_ALIGNMENT as usize;
         let region_prefix = data[dsi_region_start..header.arm9i.offset as usize].to_vec();
 
+        // The LTD module parameters are stored before the compressed part of the ARM9 program, so they can be read as-is
+        let ltd_params = (header.arm9i_build_info_offset < ARM9_COMPRESSION_START)
+            .then(|| LtdModuleParams::from_arm9(&data[program_range(&header.arm9)], header.arm9i_build_info_offset))
+            .flatten();
+        let ltd = match ltd_params {
+            Some(params) => Ltd::split(&arm9i, header.arm9i.base_addr, &params)?,
+            None => None,
+        };
+
         let config = DsiConfig {
             arm9i: DsiProgram {
                 base_address: header.arm9i.base_addr,
@@ -242,9 +347,17 @@ impl<'a> Dsi<'a> {
                 sha1_hmac_arm9_with_secure_area: header.sha1_hmac_arm9_with_secure_area,
                 sector_digests,
             }),
+            ltd: ltd.as_ref().map(|_| LtdConfig { compressed: ltd_params.is_some_and(|p| p.compressed_static_end != 0) }),
         };
 
-        Ok(Some(Self::new(arm9i, arm7i, region_prefix, config)))
+        let mut dsi = Self::new(arm9i, arm7i, region_prefix, config);
+        dsi.ltd = ltd;
+        Ok(Some(dsi))
+    }
+
+    /// Returns the parts of the ARM9i program, if it was split into its LTD module.
+    pub fn ltd(&self) -> Option<&Ltd<'a>> {
+        self.ltd.as_ref()
     }
 
     /// Returns the decrypted ARM9i program.
@@ -426,6 +539,68 @@ impl<'a> Dsi<'a> {
             modcrypt_area_1,
             modcrypt_area_2,
         })
+    }
+}
+
+impl<'a> Ltd<'a> {
+    /// Creates a new [`Ltd`] from the decompressed data before the autoload blocks, and the autoload blocks.
+    pub fn new<T: Into<Cow<'a, [u8]>>>(static_data: T, autoloads: Vec<Autoload<'a>>) -> Self {
+        Self { static_data: static_data.into(), autoloads }
+    }
+
+    /// Splits an ARM9i program into its parts. Returns `None` if the program does not have the expected layout.
+    fn split(arm9i: &[u8], base: u32, params: &LtdModuleParams) -> Result<Option<Self>, DsiError> {
+        let image = if params.compressed_static_end != 0 { LZ77.decompress(arm9i)?.into_vec() } else { arm9i.to_vec() };
+        let offset_of = |address: u32| address.checked_sub(base).map(|offset| offset as usize);
+        let (Some(autoload_start), Some(list_start), Some(list_end)) = (
+            offset_of(params.autoload_start),
+            offset_of(params.autoload_list_start),
+            offset_of(params.autoload_list_end),
+        ) else {
+            return Ok(None);
+        };
+        if list_end != image.len() || list_start > list_end || autoload_start > list_start {
+            return Ok(None);
+        }
+
+        let mut autoloads = vec![];
+        let mut offset = autoload_start;
+        let entries = image[list_start..list_end].chunks_exact(size_of::<TwlAutoloadInfoEntry>());
+        for (index, entry) in entries.enumerate() {
+            let entry: TwlAutoloadInfoEntry = bytemuck::pod_read_unaligned(entry);
+            let mut info = AutoloadInfo::new_twl(entry, index as u32);
+            info.kind = AutoloadKind::Ltd(index as u32);
+            let end = offset + entry.code_size as usize;
+            if end > list_start {
+                return Ok(None);
+            }
+            autoloads.push(Autoload::new(image[offset..end].to_vec(), info));
+            offset = end;
+        }
+        if offset != list_start {
+            return Ok(None);
+        }
+
+        Ok(Some(Self { static_data: image[..autoload_start].to_vec().into(), autoloads }))
+    }
+
+    /// Returns the decompressed data before the autoload blocks.
+    pub fn static_data(&self) -> &[u8] {
+        &self.static_data
+    }
+
+    /// Returns the autoload blocks.
+    pub fn autoloads(&self) -> &[Autoload<'a>] {
+        &self.autoloads
+    }
+}
+
+impl LtdModuleParams {
+    /// Reads the parameters from an ARM9 program, or returns `None` if they are not at the given offset.
+    fn from_arm9(arm9: &[u8], offset: u32) -> Option<Self> {
+        let offset = offset as usize;
+        let params: Self = bytemuck::pod_read_unaligned(arm9.get(offset..offset + size_of::<Self>())?);
+        (params.nitrocode == LTD_NITROCODE && params.nitrocode_rev == LTD_NITROCODE.swap_bytes()).then_some(params)
     }
 }
 
