@@ -12,3 +12,6 @@ pub mod dsprot;
 
 /// Modified RC4 stream cipher implementation.
 pub mod rc4;
+
+/// DSi modcrypt, AES-CTR encryption of DSi-specific programs.
+pub mod modcrypt;

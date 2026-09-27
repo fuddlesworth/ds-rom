@@ -7,7 +7,7 @@ use super::{
     Autoload, OverlayTable,
     raw::{
         AutoloadInfo, AutoloadInfoEntry, AutoloadKind, BuildInfo, HmacSha1Signature, HmacSha1SignatureError, NITROCODE_BYTES,
-        RawAutoloadInfoError, RawBuildInfoError,
+        RawAutoloadInfoError, RawBuildInfoError, TwlAutoloadInfoEntry,
     },
 };
 use crate::{
@@ -43,6 +43,14 @@ pub struct Arm9Offsets {
     pub autoload_callback: u32,
     /// Offset to overlay HMAC-SHA1 signature table.
     pub overlay_signatures: u32,
+    /// Whether the autoload list uses the TWL-SDK format, see [`TwlAutoloadInfoEntry`]. This is the case for DSi-enhanced
+    /// and DSi-exclusive titles.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub twl_autoload_infos: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
 }
 
 const SECURE_AREA_ID: [u8; 8] = [0xff, 0xde, 0xff, 0xe7, 0xff, 0xde, 0xff, 0xe7];
@@ -270,7 +278,7 @@ impl<'a> Arm9<'a> {
 
         let autoload_infos_start = data.len() as u32 + offsets.base_address;
         for autoload in autoloads {
-            data.extend(bytemuck::bytes_of(autoload.info().entry()));
+            data.extend(autoload.info().entry_bytes());
         }
         let autoload_infos_end = data.len() as u32 + offsets.base_address;
 
@@ -489,11 +497,18 @@ impl<'a> Arm9<'a> {
         Ok(())
     }
 
-    fn get_autoload_info_entries(&self, build_info: &BuildInfo) -> Result<&[AutoloadInfoEntry], Arm9AutoloadError> {
+    fn get_autoload_infos(&self, build_info: &BuildInfo) -> Result<Vec<AutoloadInfo>, Arm9AutoloadError> {
         let start = (build_info.autoload_infos_start - self.base_address()) as usize;
         let end = (build_info.autoload_infos_end - self.base_address()) as usize;
-        let autoload_info = AutoloadInfoEntry::borrow_from_slice(&self.data[start..end])?;
-        Ok(autoload_info)
+        let data = &self.data[start..end];
+        let autoload_infos = if self.offsets.twl_autoload_infos {
+            let entries = TwlAutoloadInfoEntry::borrow_from_slice(data)?;
+            entries.iter().enumerate().map(|(index, entry)| AutoloadInfo::new_twl(*entry, index as u32)).collect()
+        } else {
+            let entries = AutoloadInfoEntry::borrow_from_slice(data)?;
+            entries.iter().enumerate().map(|(index, entry)| AutoloadInfo::new(*entry, index as u32)).collect()
+        };
+        Ok(autoload_infos)
     }
 
     /// Returns the autoload infos of this [`Arm9`].
@@ -507,12 +522,7 @@ impl<'a> Arm9<'a> {
         if build_info.is_compressed() {
             CompressedSnafu {}.fail()?;
         }
-        Ok(self
-            .get_autoload_info_entries(build_info)?
-            .iter()
-            .enumerate()
-            .map(|(index, entry)| AutoloadInfo::new(*entry, index as u32))
-            .collect())
+        self.get_autoload_infos(build_info)
     }
 
     /// Returns the autoloads of this [`Arm9`].

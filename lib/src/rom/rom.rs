@@ -10,9 +10,9 @@ use snafu::Snafu;
 
 use super::{
     Arm7, Arm9, Arm9AutoloadError, Arm9Error, Arm9HmacSha1KeyError, Arm9Offsets, Arm9OverlaySignaturesError, Autoload, Banner,
-    BannerError, BannerImageError, BuildInfo, FileBuildError, FileParseError, FileSystem, Header, HeaderBuildError, Logo,
-    LogoError, LogoLoadError, LogoSaveError, Overlay, OverlayError, OverlayInfo, OverlayOptions, OverlayTable,
-    RomConfigAutoload, RomConfigUnknownAutoload,
+    BannerError, BannerImageError, BuildInfo, Dsi, DsiConfig, DsiError, DsiHeaderValues, FileBuildError, FileParseError,
+    FileSystem, Header, HeaderBuildError, Logo, LogoError, LogoLoadError, LogoSaveError, Overlay, OverlayError, OverlayInfo,
+    OverlayOptions, OverlayTable, RomConfigAutoload, RomConfigUnknownAutoload,
     raw::{
         self, Arm9Footer, HmacSha1Signature, RawArm9Error, RawBannerError, RawBuildInfoError, RawFatError, RawFntError,
         RawHeaderError, RawOverlayError, RomAlignmentsError, TableOffset,
@@ -27,7 +27,7 @@ use crate::{
     },
     io::{FileError, create_dir_all, create_file, create_file_and_dirs, open_file, read_file, read_to_string},
     rom::{
-        Arm9DsProtInfoError, Arm9WithTcmsOptions, OverlayDsProtError, RomConfig,
+        Arm9DsProtInfoError, Arm9WithTcmsOptions, OverlayDsProtError, RomConfig, RomConfigDsi,
         raw::{FileAlloc, MultibootSignature, RawMultibootSignatureError},
     },
 };
@@ -43,6 +43,8 @@ pub struct Rom<'a> {
     banner: Banner,
     files: FileSystem<'a>,
     multiboot_signature: Option<MultibootSignature>,
+    dsi: Option<Dsi<'a>>,
+    hmac_sha1: Option<HmacSha1>,
 
     path_order: Vec<String>,
     config: RomConfig,
@@ -51,6 +53,12 @@ pub struct Rom<'a> {
 /// Errors related to [`Rom::extract`].
 #[derive(Debug, Snafu)]
 pub enum RomExtractError {
+    /// See [`DsiError`].
+    #[snafu(transparent)]
+    Dsi {
+        /// Source error.
+        source: DsiError,
+    },
     /// See [`RawHeaderError`].
     #[snafu(transparent)]
     RawHeader {
@@ -164,6 +172,12 @@ pub enum RomExtractError {
 /// Errors related to [`Rom::build`].
 #[derive(Snafu, Debug)]
 pub enum RomBuildError {
+    /// See [`DsiError`].
+    #[snafu(transparent)]
+    Dsi {
+        /// Source error.
+        source: DsiError,
+    },
     /// See [`io::Error`].
     #[snafu(transparent)]
     Io {
@@ -418,17 +432,22 @@ impl<'a> Rom<'a> {
 
         // --------------------- Load ARM9 overlays ---------------------
         let arm9_overlays = if let Some(arm9_overlays_config) = &config.arm9_overlays {
-            Self::load_overlays(&path.join(arm9_overlays_config), "arm9", arm9_hmac_sha1, &options)?
+            Self::load_overlays(&path.join(arm9_overlays_config), "arm9", arm9_hmac_sha1.clone(), &options)?
         } else {
             Default::default()
         };
 
         // --------------------- Build ARM9 program ---------------------
-        let mut arm9 = Arm9::with_autoloads(arm9, &autoloads, arm9_build_config.offsets, Arm9WithTcmsOptions {
-            originally_compressed: arm9_build_config.compressed,
-            originally_encrypted: arm9_build_config.encrypted,
-            dsprot_state: arm9_build_config.dsprot_state,
-        })?;
+        let mut arm9 = Arm9::with_autoloads(
+            arm9,
+            &autoloads,
+            arm9_build_config.offsets,
+            Arm9WithTcmsOptions {
+                originally_compressed: arm9_build_config.compressed,
+                originally_encrypted: arm9_build_config.encrypted,
+                dsprot_state: arm9_build_config.dsprot_state,
+            },
+        )?;
         arm9_build_config.build_info.assign_to_raw(arm9.build_info_mut()?);
         arm9.update_overlay_signatures(&arm9_overlays)?;
         if arm9.dsprot_state().is_unencrypted() && options.encrypt {
@@ -489,6 +508,17 @@ impl<'a> Rom<'a> {
             None
         };
 
+        // --------------------- Load DSi-specific parts ---------------------
+        let dsi = if let Some(dsi_config) = &config.dsi {
+            let dsi_config_data: DsiConfig = serde_saphyr::from_reader(open_file(path.join(&dsi_config.config))?)?;
+            let arm9i = read_file(path.join(&dsi_config.arm9i))?;
+            let arm7i = read_file(path.join(&dsi_config.arm7i))?;
+            let region_prefix = read_file(path.join(&dsi_config.region_prefix))?;
+            Some(Dsi::new(arm9i, arm7i, region_prefix, dsi_config_data))
+        } else {
+            None
+        };
+
         Ok(Self {
             header,
             header_logo,
@@ -500,6 +530,8 @@ impl<'a> Rom<'a> {
             files,
             path_order,
             multiboot_signature,
+            dsi,
+            hmac_sha1: arm9_hmac_sha1,
             config,
         })
     }
@@ -518,12 +550,15 @@ impl<'a> Rom<'a> {
             let data = read_file(path.join(config.file_name))?;
             let compressed = config.info.compressed;
             config.info.compressed = false;
-            let mut overlay = Overlay::new(data, OverlayOptions {
-                info: config.info,
-                originally_compressed: compressed,
-                originally_signed: config.signed,
-                dsprot_state: config.dsprot,
-            })?;
+            let mut overlay = Overlay::new(
+                data,
+                OverlayOptions {
+                    info: config.info,
+                    originally_compressed: compressed,
+                    originally_signed: config.signed,
+                    dsprot_state: config.dsprot,
+                },
+            )?;
 
             if overlay.dsprot_state().is_unencrypted() && options.encrypt {
                 log::info!("Encrypting DS Protect in {processor} overlay {}", overlay.id());
@@ -687,6 +722,14 @@ impl<'a> Rom<'a> {
             log::warn!("Multiboot signature not found, but config requested it to be saved");
         }
 
+        // --------------------- Save DSi-specific parts ---------------------
+        if let (Some(dsi), Some(dsi_config)) = (&self.dsi, &self.config.dsi) {
+            serde_saphyr::to_io_writer(&mut create_file_and_dirs(path.join(&dsi_config.config))?, dsi.config())?;
+            create_file_and_dirs(path.join(&dsi_config.arm9i))?.write_all(dsi.arm9i())?;
+            create_file_and_dirs(path.join(&dsi_config.arm7i))?.write_all(dsi.arm7i())?;
+            create_file_and_dirs(path.join(&dsi_config.region_prefix))?.write_all(dsi.region_prefix())?;
+        }
+
         Ok(())
     }
 
@@ -771,7 +814,10 @@ impl<'a> Rom<'a> {
             })
             .collect();
 
-        let has_arm9_hmac_sha1 = decompressed_arm9.hmac_sha1_key()?.is_some();
+        let arm9_hmac_sha1_key = decompressed_arm9.hmac_sha1_key()?;
+        let has_arm9_hmac_sha1 = arm9_hmac_sha1_key.is_some();
+        let arm9_footer = rom.arm9_footer_opt().map_err(RawArm9Error::from)?.is_some();
+        let dsi = Dsi::extract(rom)?;
 
         let multiboot_signature = rom.multiboot_signature()?;
 
@@ -819,6 +865,13 @@ impl<'a> Rom<'a> {
                 Some("multiboot_signature.yaml".into())
             },
             arm9_hmac_sha1_key: has_arm9_hmac_sha1.then_some("arm9/hmac_sha1_key.bin".into()),
+            arm9_footer,
+            dsi: dsi.is_some().then(|| RomConfigDsi {
+                config: "dsi/dsi.yaml".into(),
+                arm9i: "dsi/arm9i.bin".into(),
+                arm7i: "dsi/arm7i.bin".into(),
+                region_prefix: "dsi/region_prefix.bin".into(),
+            }),
             alignment,
             padding,
         };
@@ -833,6 +886,8 @@ impl<'a> Rom<'a> {
             banner: Banner::load_raw(&banner),
             files: file_root,
             multiboot_signature,
+            dsi,
+            hmac_sha1: arm9_hmac_sha1_key.map(HmacSha1::new),
             path_order,
             config,
         })
@@ -858,8 +913,10 @@ impl<'a> Rom<'a> {
         context.arm9_autoload_callback = Some(self.arm9.autoload_callback());
         context.arm9_build_info_offset = Some(self.arm9.build_info_offset());
         cursor.write_all(self.arm9.full_data())?;
-        let footer = Arm9Footer::new(self.arm9.build_info_offset(), self.arm9.overlay_signatures_offset());
-        cursor.write_all(bytemuck::bytes_of(&footer))?;
+        if self.config.arm9_footer {
+            let footer = Arm9Footer::new(self.arm9.build_info_offset(), self.arm9.overlay_signatures_offset());
+            cursor.write_all(bytemuck::bytes_of(&footer))?;
+        }
 
         let max_file_id = self.files.max_file_id();
         let mut file_allocs = vec![FileAlloc::default(); max_file_id as usize + 1];
@@ -889,7 +946,7 @@ impl<'a> Rom<'a> {
         self.align(&mut cursor, self.config.alignment.arm7, self.config.padding.arm7)?;
         context.arm7_offset = Some(cursor.position() as u32);
         context.arm7_autoload_callback = Some(self.arm7.autoload_callback());
-        context.arm7_build_info_offset = None;
+        context.arm7_build_info_offset = Some(self.arm7.build_info_offset()).filter(|&offset| offset != 0);
         cursor.write_all(self.arm7.full_data())?;
 
         if !self.arm7_overlay_table.is_empty() {
@@ -948,9 +1005,31 @@ impl<'a> Rom<'a> {
             cursor.write_all(contents).expect("failed to write file contents");
         });
 
+        // --------------------- Write DSi-specific parts ---------------------
+        let dsi_layout = if let Some(dsi) = &self.dsi {
+            self.align(&mut cursor, dsi.config().digest_sector_size, self.config.padding.file_image)?;
+            let layout = dsi.layout(context.arm9_offset.unwrap(), cursor.position() as u32);
+
+            // Hashtables are written by `Dsi::finalize` once the rest of the ROM is written
+            self.write_padding_until(&mut cursor, layout.digest_sector_hashtable.offset, self.config.padding.rom)?;
+            cursor.write_all(&vec![0; layout.digest_sector_hashtable.size as usize])?;
+            self.write_padding_until(&mut cursor, layout.digest_block_hashtable.offset, self.config.padding.rom)?;
+            cursor.write_all(&vec![0; layout.digest_block_hashtable.size as usize])?;
+            self.write_padding_until(&mut cursor, layout.dsi_region_start, self.config.padding.rom)?;
+            cursor.write_all(dsi.region_prefix())?;
+            self.write_padding_until(&mut cursor, layout.arm9i.offset, self.config.padding.rom)?;
+            cursor.write_all(dsi.arm9i())?;
+            self.write_padding_until(&mut cursor, layout.arm7i.offset, self.config.padding.rom)?;
+            cursor.write_all(dsi.arm7i())?;
+            self.write_padding_until(&mut cursor, layout.rom_size_dsi, self.config.padding.rom)?;
+            Some(layout)
+        } else {
+            None
+        };
+
         // --------------------- Write multiboot signature ---------------------
         // Multiboot signature is placed "after" the ROM ends
-        context.rom_size = Some(cursor.position() as u32);
+        context.rom_size = Some(dsi_layout.map_or(cursor.position() as u32, |layout| layout.rom_size_ds));
         if let Some(multiboot_signature) = &self.multiboot_signature {
             cursor.write_all(bytemuck::bytes_of(multiboot_signature))?;
         }
@@ -963,12 +1042,35 @@ impl<'a> Rom<'a> {
         cursor.set_position(context.fat_offset.unwrap().offset as u64);
         cursor.write_all(bytemuck::cast_slice(&file_allocs))?;
 
+        // --------------------- Write DSi digests and modcrypt ---------------------
+        if let (Some(dsi), Some(layout)) = (&self.dsi, dsi_layout) {
+            let arm7 = TableOffset { offset: context.arm7_offset.unwrap(), size: self.arm7.full_data().len() as u32 };
+            context.dsi = Some(dsi.finalize(
+                cursor.get_mut(),
+                layout,
+                &self.arm9,
+                context.arm9_offset.unwrap(),
+                arm7,
+                context.banner_offset.unwrap(),
+                self.header.original.gamecode.0,
+                self.hmac_sha1.as_ref(),
+                context.blowfish_key,
+            )?);
+        }
+
         // --------------------- Update header ---------------------
         cursor.set_position(context.header_offset.unwrap() as u64);
         let header = self.header.build(&context, &self)?;
         cursor.write_all(bytemuck::bytes_of(&header))?;
 
         Ok(raw::Rom::new(cursor.into_inner()))
+    }
+
+    fn write_padding_until(&self, cursor: &mut Cursor<Vec<u8>>, offset: u32, padding_value: u8) -> Result<(), RomBuildError> {
+        let position = cursor.position() as u32;
+        assert!(position <= offset, "cannot pad backwards from {position:#x} to {offset:#x}");
+        cursor.write_all(&vec![padding_value; (offset - position) as usize])?;
+        Ok(())
     }
 
     fn align(&self, cursor: &mut Cursor<Vec<u8>>, alignment: u32, padding_value: u8) -> Result<(), RomBuildError> {
@@ -989,6 +1091,11 @@ impl<'a> Rom<'a> {
     /// Returns a mutable reference to the header logo of this [`Rom`].
     pub fn header_logo_mut(&mut self) -> &mut Logo {
         &mut self.header_logo
+    }
+
+    /// Returns the DSi-specific parts of this [`Rom`], if it is DSi-enhanced or DSi-exclusive.
+    pub fn dsi(&self) -> Option<&Dsi<'a>> {
+        self.dsi.as_ref()
     }
 
     /// Returns a reference to the ARM9 program of this [`Rom`].
@@ -1103,6 +1210,8 @@ pub struct BuildContext<'a> {
     pub arm7_build_info_offset: Option<u32>,
     /// Total ROM size.
     pub rom_size: Option<u32>,
+    /// Values for DSi-enhanced and DSi-exclusive ROMs.
+    pub dsi: Option<DsiHeaderValues>,
 }
 
 /// Options for [`Rom::load`].

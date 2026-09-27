@@ -26,6 +26,9 @@ pub struct Header {
     /// Values for DS games after DSi release, [`HeaderVersion::DsPostDsi`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ds_post_dsi: Option<HeaderDsPostDsi>,
+    /// Values for DSi-enhanced and DSi-exclusive games.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dsi: Option<HeaderDsi>,
 }
 
 /// Values for the original header version, [`HeaderVersion::Original`].
@@ -76,6 +79,51 @@ pub struct HeaderDsPostDsi {
     pub rsa_sha1: Box<[u8]>,
 }
 
+/// Values for DSi-enhanced and DSi-exclusive games. Values which depend on the ROM layout are computed when building.
+#[derive(Serialize, Deserialize)]
+pub struct HeaderDsi {
+    /// DSi-specific flags, see [`DsiFlags`].
+    pub dsi_flags: u8,
+    /// MBK1 to MBK5
+    pub memory_banks_wram: [u32; 5],
+    /// MBK6 to MBK8
+    pub memory_banks_arm9: [u32; 3],
+    /// MBK6 to MBK8
+    pub memory_banks_arm7: [u32; 3],
+    /// MBK9
+    pub memory_bank_9: u32,
+    /// Region flags, see [`RegionFlags`].
+    pub region_flags: u32,
+    /// Access control, see [`AccessControl`].
+    pub access_control: u32,
+    /// ARM7 SCFG_EXT7 setting.
+    pub arm7_scfg_ext7_setting: u32,
+    /// SD/MMC size of shared2/0000 file
+    pub sd_shared2_0000_size: u8,
+    /// SD/MMC size of shared2/0001 file
+    pub sd_shared2_0001_size: u8,
+    /// EULA version.
+    pub eula_version: u8,
+    /// Use age ratings.
+    pub use_ratings: bool,
+    /// SD/MMC size of shared/0002 file
+    pub sd_shared2_0002_size: u8,
+    /// SD/MMC size of shared/0003 file
+    pub sd_shared2_0003_size: u8,
+    /// SD/MMC size of shared/0004 file
+    pub sd_shared2_0004_size: u8,
+    /// SD/MMC size of shared/0005 file
+    pub sd_shared2_0005_size: u8,
+    /// File type.
+    pub file_type: u32,
+    /// SD/MMC public.sav file size.
+    pub sd_public_sav_size: u32,
+    /// SD/MMC private.sav file size.
+    pub sd_private_sav_size: u32,
+    /// Age ratings.
+    pub age_ratings: [u8; 0x10],
+}
+
 /// Errors related to [`Header::build`].
 #[derive(Snafu, Debug)]
 pub enum HeaderBuildError {
@@ -114,6 +162,28 @@ impl Header {
                 sha1_hmac_unk1: header.sha1_hmac_unk1,
                 sha1_hmac_unk2: header.sha1_hmac_unk2,
                 rsa_sha1: Box::new(header.rsa_sha1),
+            }),
+            dsi: header.is_dsi().then(|| HeaderDsi {
+                dsi_flags: header.dsi_flags.into_bits(),
+                memory_banks_wram: header.memory_banks_wram,
+                memory_banks_arm9: header.memory_banks_arm9,
+                memory_banks_arm7: header.memory_banks_arm7,
+                memory_bank_9: header.memory_bank_9,
+                region_flags: header.region_flags.into_bits(),
+                access_control: header.access_control.into_bits(),
+                arm7_scfg_ext7_setting: header.arm7_scfg_ext7_setting,
+                sd_shared2_0000_size: header.sd_shared2_0000_size,
+                sd_shared2_0001_size: header.sd_shared2_0001_size,
+                eula_version: header.eula_version,
+                use_ratings: header.use_ratings,
+                sd_shared2_0002_size: header.sd_shared2_0002_size,
+                sd_shared2_0003_size: header.sd_shared2_0003_size,
+                sd_shared2_0004_size: header.sd_shared2_0004_size,
+                sd_shared2_0005_size: header.sd_shared2_0005_size,
+                file_type: header.file_type,
+                sd_public_sav_size: header.sd_public_sav_size,
+                sd_private_sav_size: header.sd_private_sav_size,
+                age_ratings: header.age_ratings,
             }),
         }
     }
@@ -175,12 +245,17 @@ impl Header {
             secure_area_disable: 0,
             rom_size_ds: context.rom_size.expect("ROM size must be known"),
             header_size: size_of::<raw::Header>() as u32,
-            arm9_build_info_offset: if self.original.has_arm9_build_info_offset {
-                context.arm9_build_info_offset.map(|offset| offset + arm9_offset).unwrap_or(0)
-            } else {
-                0
+            // Build info offsets are relative to their program in DSi titles
+            arm9_build_info_offset: match (self.original.has_arm9_build_info_offset, context.arm9_build_info_offset) {
+                (false, _) | (true, None) => 0,
+                (true, Some(offset)) if self.dsi.is_some() => offset,
+                (true, Some(offset)) => offset + arm9_offset,
             },
-            arm7_build_info_offset: context.arm7_build_info_offset.map(|offset| offset + arm7_offset).unwrap_or(0),
+            arm7_build_info_offset: match context.arm7_build_info_offset {
+                None => 0,
+                Some(offset) if self.dsi.is_some() => offset,
+                Some(offset) => offset + arm7_offset,
+            },
             ds_rom_region_end: 0,
             dsi_rom_region_end: 0,
             rom_nand_end: self.original.rom_nand_end,
@@ -255,6 +330,63 @@ impl Header {
             header.rsa_sha1.copy_from_slice(&ds_post_dsi.rsa_sha1);
         }
 
+        if let (Some(dsi), Some(values)) = (&self.dsi, &context.dsi) {
+            let layout = &values.layout;
+            header.capacity = Capacity::from_size(layout.rom_size_dsi);
+            header.dsi_flags = DsiFlags::from_bits(dsi.dsi_flags);
+            if header.secure_area_crc == 0 {
+                header.secure_area_crc = values.secure_area_crc.unwrap_or(0);
+            }
+            header.rom_size_ds = layout.rom_size_ds;
+            header.ds_rom_region_end = (layout.dsi_region_start / DSI_REGION_UNIT) as u16;
+            header.dsi_rom_region_end = (layout.dsi_region_start / DSI_REGION_UNIT) as u16;
+            header.memory_banks_wram = dsi.memory_banks_wram;
+            header.memory_banks_arm9 = dsi.memory_banks_arm9;
+            header.memory_banks_arm7 = dsi.memory_banks_arm7;
+            header.memory_bank_9 = dsi.memory_bank_9;
+            header.region_flags = RegionFlags::from_bits(dsi.region_flags);
+            header.access_control = AccessControl::from_bits(dsi.access_control);
+            header.arm7_scfg_ext7_setting = dsi.arm7_scfg_ext7_setting;
+            header.arm9i = layout.arm9i;
+            header.arm7i = layout.arm7i;
+            header.digest_ds_area = layout.digest_ds_area;
+            header.digest_dsi_area = layout.digest_dsi_area;
+            header.digest_sector_hashtable = layout.digest_sector_hashtable;
+            header.digest_block_hashtable = layout.digest_block_hashtable;
+            if let Some(dsi_rom) = rom.dsi() {
+                header.digest_sector_size = dsi_rom.config().digest_sector_size;
+                header.digest_sector_count = dsi_rom.config().digest_sector_count;
+                header.arm9i_build_info_offset = dsi_rom.config().arm9i.build_info;
+                header.arm7i_build_info_offset = dsi_rom.config().arm7i.build_info;
+            }
+            header.banner_size = context.banner_offset.map(|b| b.size).unwrap_or(0);
+            header.sd_shared2_0000_size = dsi.sd_shared2_0000_size;
+            header.sd_shared2_0001_size = dsi.sd_shared2_0001_size;
+            header.eula_version = dsi.eula_version;
+            header.use_ratings = dsi.use_ratings;
+            header.rom_size_dsi = layout.rom_size_dsi;
+            header.sd_shared2_0002_size = dsi.sd_shared2_0002_size;
+            header.sd_shared2_0003_size = dsi.sd_shared2_0003_size;
+            header.sd_shared2_0004_size = dsi.sd_shared2_0004_size;
+            header.sd_shared2_0005_size = dsi.sd_shared2_0005_size;
+            header.modcrypt_area_1 = values.modcrypt_area_1;
+            header.modcrypt_area_2 = values.modcrypt_area_2;
+            let mut gamecode_rev = self.original.gamecode;
+            gamecode_rev.0.reverse();
+            header.gamecode_rev = gamecode_rev;
+            header.file_type = dsi.file_type;
+            header.sd_public_sav_size = dsi.sd_public_sav_size;
+            header.sd_private_sav_size = dsi.sd_private_sav_size;
+            header.age_ratings = dsi.age_ratings;
+            header.sha1_hmac_arm9_with_secure_area = values.sha1_hmac_arm9_with_secure_area;
+            header.sha1_hmac_arm7 = values.sha1_hmac_arm7;
+            header.sha1_hmac_digest = values.sha1_hmac_digest;
+            header.sha1_hmac_banner = values.sha1_hmac_banner;
+            header.sha1_hmac_arm9i = values.sha1_hmac_arm9i;
+            header.sha1_hmac_arm7i = values.sha1_hmac_arm7i;
+            header.sha1_hmac_arm9 = values.sha1_hmac_arm9;
+        }
+
         header.header_crc = CRC_16_MODBUS.checksum(&bytemuck::bytes_of(&header)[0..offset_of!(raw::Header, header_crc)]);
         Ok(header)
     }
@@ -268,3 +400,6 @@ impl Header {
         }
     }
 }
+
+/// The DS and DSi region boundaries in the header are in units of this size.
+const DSI_REGION_UNIT: u32 = 0x80000;

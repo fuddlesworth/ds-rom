@@ -44,6 +44,14 @@ pub struct RomConfig {
     /// Path to HMAC SHA1 key file for ARM9
     pub arm9_hmac_sha1_key: Option<PathBuf>,
 
+    /// Whether the ARM9 program is followed by a footer. DSi-enhanced titles built with the TWL-SDK have no footer.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub arm9_footer: bool,
+
+    /// DSi-specific parts of DSi-enhanced and DSi-exclusive ROMs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dsi: Option<RomConfigDsi>,
+
     /// Path to multiboot signature YAML
     pub multiboot_signature: Option<PathBuf>,
 
@@ -125,4 +133,25 @@ pub struct RomConfigPaddingValues {
     pub file_image: u8,
     /// Aligning the ROM size to a power of two.
     pub rom: u8,
+}
+
+/// Paths to the DSi-specific parts of a ROM, see [`crate::rom::Dsi`].
+#[derive(Serialize, Deserialize, Clone)]
+pub struct RomConfigDsi {
+    /// Path to the DSi config, see [`crate::rom::DsiConfig`].
+    pub config: PathBuf,
+    /// Path to the decrypted ARM9i program.
+    pub arm9i: PathBuf,
+    /// Path to the decrypted ARM7i program.
+    pub arm7i: PathBuf,
+    /// Path to the data between the start of the DSi region and the ARM9i program.
+    pub region_prefix: PathBuf,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn is_true(value: &bool) -> bool {
+    *value
 }

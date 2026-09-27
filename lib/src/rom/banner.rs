@@ -81,7 +81,7 @@ impl Banner {
                 chinese: Self::load_title(banner, version, Language::Chinese),
                 korean: Self::load_title(banner, version, Language::Korean),
             },
-            images: BannerImages::from_bitmap(*banner.bitmap(), *banner.palette()),
+            images: BannerImages::from_raw(banner),
             keyframes: None,
         }
     }
@@ -104,7 +104,8 @@ impl Banner {
         // given time according to the keyframes. This means that to convert the PNG animation frames to indexed bitmaps, we
         // may need more than 8 PNG files if a palette is reused on multiple bitmaps. Then we have to deduplicate indexed
         // bitmaps with precisely the same indexes. Not very efficient, but it may be our only option for modern image formats.
-        if self.version > BannerVersion::Korea {
+        // Animated icons can only be built from a raw animation file, see `BannerImages::animation`
+        if self.version > BannerVersion::Korea && self.images.animation.is_none() {
             return VersionNotSupportedSnafu { max: BannerVersion::Korea, actual: self.version }.fail();
         }
 
@@ -113,6 +114,10 @@ impl Banner {
 
         *banner.bitmap_mut() = self.images.bitmap;
         *banner.palette_mut() = self.images.palette;
+
+        if let (Some(animation), Some(raw_animation)) = (&self.images.animation, banner.animation_mut()) {
+            *raw_animation = **animation;
+        }
 
         if let Some(keyframes) = &self.keyframes {
             if keyframes.len() > 64 {
@@ -152,11 +157,17 @@ pub struct BannerImages {
     /// Palettes for animated icon
     #[serde(skip)]
     pub animation_palettes: Option<Box<[BannerPalette]>>,
+    /// Raw animated icon of DSi banners, stored as-is until the bitmaps and palettes can be converted to PNG files.
+    #[serde(skip)]
+    pub animation: Option<Box<raw::BannerAnimation>>,
 
     /// Path to bitmap PNG.
     pub bitmap_path: PathBuf,
     /// Path to palette PNG.
     pub palette_path: PathBuf,
+    /// Path to raw animated icon, see [`Self::animation`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub animation_path: Option<PathBuf>,
 }
 
 /// Errors related to [`BannerImages`].
@@ -196,6 +207,18 @@ pub enum BannerImageError {
         /// Backtrace to the source of the error.
         backtrace: Backtrace,
     },
+    /// Occurs when loading a raw animated icon with the wrong size.
+    #[snafu(display("raw banner animation {path:?} must be {expected:#x} bytes but got {actual:#x} bytes:\n{backtrace}"))]
+    WrongAnimationSize {
+        /// Path to the raw animation.
+        path: PathBuf,
+        /// Expected size.
+        expected: usize,
+        /// Actual input size.
+        actual: usize,
+        /// Backtrace to the source of the error.
+        backtrace: Backtrace,
+    },
 }
 
 impl BannerImages {
@@ -208,7 +231,19 @@ impl BannerImages {
             animation_palettes: None,
             bitmap_path: "bitmap.png".into(),
             palette_path: "palette.png".into(),
+            animation: None,
+            animation_path: None,
         }
+    }
+
+    /// Creates a new [`BannerImages`] from a raw banner, including the animated icon if there is one.
+    pub fn from_raw(banner: &raw::Banner) -> Self {
+        let mut images = Self::from_bitmap(*banner.bitmap(), *banner.palette());
+        if let Some(animation) = banner.animation() {
+            images.animation = Some(Box::new(*animation));
+            images.animation_path = Some("animation.bin".into());
+        }
+        images
     }
 
     /// Loads the bitmap and palette
@@ -258,6 +293,16 @@ impl BannerImages {
 
         self.bitmap = bitmap;
         self.palette = palette;
+
+        if let Some(animation_path) = &self.animation_path {
+            let path = path.join(animation_path);
+            let data = std::fs::read(&path)?;
+            let expected = size_of::<raw::BannerAnimation>();
+            if data.len() != expected {
+                return WrongAnimationSizeSnafu { path, expected, actual: data.len() }.fail();
+            }
+            self.animation = Some(Box::new(bytemuck::pod_read_unaligned(&data)));
+        }
         Ok(())
     }
 
@@ -284,6 +329,10 @@ impl BannerImages {
 
         bitmap_image.save(path.join(&self.bitmap_path))?;
         palette_image.save(path.join(&self.palette_path))?;
+
+        if let (Some(animation), Some(animation_path)) = (&self.animation, &self.animation_path) {
+            std::fs::write(path.join(animation_path), bytemuck::bytes_of(animation.as_ref()))?;
+        }
         Ok(())
     }
 }

@@ -233,6 +233,16 @@ pub enum RawHeaderError {
 }
 
 impl Header {
+    /// Returns whether this is a DSi-enhanced or DSi-exclusive ROM.
+    pub fn is_dsi(&self) -> bool {
+        self.unitcode & 0x2 != 0
+    }
+
+    /// Returns whether the modcrypt areas are encrypted with the debug key instead of the retail key.
+    pub fn uses_modcrypt_debug_key(&self) -> bool {
+        self.dsi_flags.modcrypt_debug_key()
+    }
+
     /// Returns the version of this [`Header`].
     pub fn version(&self) -> HeaderVersion {
         if self.dsi_flags_2.0 != 0 {

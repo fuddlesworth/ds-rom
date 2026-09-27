@@ -111,8 +111,9 @@ impl<'a> Rom<'a> {
         let end = start + header.arm9.size as usize;
         let data = &self.data[start..end];
 
-        let footer = self.arm9_footer()?;
-        let build_info_offset = if header.arm9_build_info_offset == 0 {
+        // Only `None` if the header has a build info offset, see `arm9_footer_opt`
+        let footer = self.arm9_footer_opt()?;
+        let build_info_offset = if let (0, Some(footer)) = (header.arm9_build_info_offset, footer) {
             footer.build_info_offset
         } else if header.arm9_build_info_offset > header.arm9.offset {
             header.arm9_build_info_offset - header.arm9.offset
@@ -121,13 +122,31 @@ impl<'a> Rom<'a> {
             header.arm9_build_info_offset
         };
 
-        Ok(Arm9::new(Cow::Borrowed(data), Arm9Offsets {
-            base_address: header.arm9.base_addr,
-            entry_function: header.arm9.entry,
-            build_info: build_info_offset,
-            autoload_callback: header.arm9_autoload_callback,
-            overlay_signatures: footer.overlay_signatures_offset,
-        })?)
+        Ok(Arm9::new(
+            Cow::Borrowed(data),
+            Arm9Offsets {
+                base_address: header.arm9.base_addr,
+                entry_function: header.arm9.entry,
+                build_info: build_info_offset,
+                autoload_callback: header.arm9_autoload_callback,
+                overlay_signatures: footer.map_or(0, |footer| footer.overlay_signatures_offset),
+                twl_autoload_infos: header.unitcode != 0,
+            },
+        )?)
+    }
+
+    /// Returns the ARM9 footer of this [`Rom`], or `None` if there is no footer. DSi-enhanced titles built with the TWL-SDK
+    /// omit the footer and store the build info offset in the header instead.
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::arm9_footer`]. A missing nitrocode is not an error if the header has an ARM9 build info offset.
+    pub fn arm9_footer_opt(&self) -> Result<Option<Arm9Footer>, Arm9FooterError> {
+        match self.arm9_footer() {
+            Ok(footer) => Ok(Some(*footer)),
+            Err(Arm9FooterError::NoNitrocode { .. }) if self.header()?.arm9_build_info_offset != 0 => Ok(None),
+            Err(error) => Err(error),
+        }
     }
 
     /// Returns a reference to the ARM9 footer of this [`Rom`].
@@ -217,18 +236,22 @@ impl<'a> Rom<'a> {
         let end = start + header.arm7.size as usize;
         let data = &self.data[start..end];
 
-        let build_info_offset = if header.arm7_build_info_offset == 0 {
-            0
-        } else {
+        let build_info_offset = if header.arm7_build_info_offset > header.arm7.offset {
             header.arm7_build_info_offset - header.arm7.offset
+        } else {
+            // Zero if absent. Not an absolute ROM offset in DSi titles
+            header.arm7_build_info_offset
         };
 
-        Ok(Arm7::new(Cow::Borrowed(data), Arm7Offsets {
-            base_address: header.arm7.base_addr,
-            entry_function: header.arm7.entry,
-            build_info: build_info_offset,
-            autoload_callback: header.arm7_autoload_callback,
-        }))
+        Ok(Arm7::new(
+            Cow::Borrowed(data),
+            Arm7Offsets {
+                base_address: header.arm7.base_addr,
+                entry_function: header.arm7.entry,
+                build_info: build_info_offset,
+                autoload_callback: header.arm7_autoload_callback,
+            },
+        ))
     }
 
     /// Returns the ARM7 overlay table of this [`Rom`].
