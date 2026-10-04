@@ -279,7 +279,8 @@ impl<'a> Dsi<'a> {
             nitrocode: LTD_NITROCODE,
             nitrocode_rev: LTD_NITROCODE.swap_bytes(),
         };
-        let dsi = Self { arm9i: arm9i.into(), ltd: Some(ltd), arm7i: arm7i.into(), region_prefix: region_prefix.into(), config };
+        let dsi =
+            Self { arm9i: arm9i.into(), ltd: Some(ltd), arm7i: arm7i.into(), region_prefix: region_prefix.into(), config };
         Ok((dsi, params))
     }
 
@@ -550,13 +551,15 @@ impl<'a> Ltd<'a> {
 
     /// Splits an ARM9i program into its parts. Returns `None` if the program does not have the expected layout.
     fn split(arm9i: &[u8], base: u32, params: &LtdModuleParams) -> Result<Option<Self>, DsiError> {
-        let image = if params.compressed_static_end != 0 { LZ77.decompress(arm9i)?.into_vec() } else { arm9i.to_vec() };
+        let image = if params.compressed_static_end != 0 {
+            LZ77.decompress(arm9i)?.into_vec()
+        } else {
+            arm9i.to_vec()
+        };
         let offset_of = |address: u32| address.checked_sub(base).map(|offset| offset as usize);
-        let (Some(autoload_start), Some(list_start), Some(list_end)) = (
-            offset_of(params.autoload_start),
-            offset_of(params.autoload_list_start),
-            offset_of(params.autoload_list_end),
-        ) else {
+        let (Some(autoload_start), Some(list_start), Some(list_end)) =
+            (offset_of(params.autoload_start), offset_of(params.autoload_list_start), offset_of(params.autoload_list_end))
+        else {
             return Ok(None);
         };
         if list_end != image.len() || list_start > list_end || autoload_start > list_start {

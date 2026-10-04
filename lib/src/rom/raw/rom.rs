@@ -122,17 +122,14 @@ impl<'a> Rom<'a> {
             header.arm9_build_info_offset
         };
 
-        Ok(Arm9::new(
-            Cow::Borrowed(data),
-            Arm9Offsets {
-                base_address: header.arm9.base_addr,
-                entry_function: header.arm9.entry,
-                build_info: build_info_offset,
-                autoload_callback: header.arm9_autoload_callback,
-                overlay_signatures: footer.map_or(0, |footer| footer.overlay_signatures_offset),
-                twl_autoload_infos: header.unitcode != 0,
-            },
-        )?)
+        Ok(Arm9::new(Cow::Borrowed(data), Arm9Offsets {
+            base_address: header.arm9.base_addr,
+            entry_function: header.arm9.entry,
+            build_info: build_info_offset,
+            autoload_callback: header.arm9_autoload_callback,
+            overlay_signatures: footer.map_or(0, |footer| footer.overlay_signatures_offset),
+            twl_autoload_infos: header.unitcode != 0,
+        })?)
     }
 
     /// Returns the ARM9 footer of this [`Rom`], or `None` if there is no footer. DSi-enhanced titles built with the TWL-SDK
@@ -243,15 +240,12 @@ impl<'a> Rom<'a> {
             header.arm7_build_info_offset
         };
 
-        Ok(Arm7::new(
-            Cow::Borrowed(data),
-            Arm7Offsets {
-                base_address: header.arm7.base_addr,
-                entry_function: header.arm7.entry,
-                build_info: build_info_offset,
-                autoload_callback: header.arm7_autoload_callback,
-            },
-        ))
+        Ok(Arm7::new(Cow::Borrowed(data), Arm7Offsets {
+            base_address: header.arm7.base_addr,
+            entry_function: header.arm7.entry,
+            build_info: build_info_offset,
+            autoload_callback: header.arm7_autoload_callback,
+        }))
     }
 
     /// Returns the ARM7 overlay table of this [`Rom`].

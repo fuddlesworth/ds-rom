@@ -338,10 +338,7 @@ impl BannerImages {
     }
 
     /// Loads an RGBA PNG by looking up each pixel's color in the palette.
-    fn load_rgba_bitmap(
-        path: &Path,
-        palette_image: &image::DynamicImage,
-    ) -> Result<BannerBitmap, BannerImageError> {
+    fn load_rgba_bitmap(path: &Path, palette_image: &image::DynamicImage) -> Result<BannerBitmap, BannerImageError> {
         let bitmap_image = ImageReader::open(path)?.decode()?;
         if bitmap_image.width() != 32 || bitmap_image.height() != 32 {
             return WrongSizeSnafu {

@@ -10,9 +10,9 @@ use snafu::Snafu;
 
 use super::{
     Arm7, Arm9, Arm9AutoloadError, Arm9Error, Arm9HmacSha1KeyError, Arm9Offsets, Arm9OverlaySignaturesError, Autoload, Banner,
-    BannerError, BannerImageError, BuildInfo, Dsi, DsiConfig, DsiError, DsiHeaderValues, FileBuildError, FileParseError, Ltd,
-    FileSystem, Header, HeaderBuildError, Logo, LogoError, LogoLoadError, LogoSaveError, Overlay, OverlayError, OverlayInfo,
-    OverlayOptions, OverlayTable, RomConfigAutoload, RomConfigUnknownAutoload,
+    BannerError, BannerImageError, BuildInfo, Dsi, DsiConfig, DsiError, DsiHeaderValues, FileBuildError, FileParseError,
+    FileSystem, Header, HeaderBuildError, Logo, LogoError, LogoLoadError, LogoSaveError, Ltd, Overlay, OverlayError,
+    OverlayInfo, OverlayOptions, OverlayTable, RomConfigAutoload, RomConfigUnknownAutoload,
     raw::{
         self, Arm9Footer, HmacSha1Signature, RawArm9Error, RawBannerError, RawBuildInfoError, RawFatError, RawFntError,
         RawHeaderError, RawOverlayError, RomAlignmentsError, TableOffset,
@@ -467,16 +467,11 @@ impl<'a> Rom<'a> {
         };
 
         // --------------------- Build ARM9 program ---------------------
-        let mut arm9 = Arm9::with_autoloads(
-            arm9,
-            &autoloads,
-            arm9_build_config.offsets,
-            Arm9WithTcmsOptions {
-                originally_compressed: arm9_build_config.compressed,
-                originally_encrypted: arm9_build_config.encrypted,
-                dsprot_state: arm9_build_config.dsprot_state,
-            },
-        )?;
+        let mut arm9 = Arm9::with_autoloads(arm9, &autoloads, arm9_build_config.offsets, Arm9WithTcmsOptions {
+            originally_compressed: arm9_build_config.compressed,
+            originally_encrypted: arm9_build_config.encrypted,
+            dsprot_state: arm9_build_config.dsprot_state,
+        })?;
         arm9_build_config.build_info.assign_to_raw(arm9.build_info_mut()?);
         if let (Some(dsi), Some(params)) = (&dsi, &ltd_params) {
             arm9.write_ltd_params(dsi.config().arm9i.build_info, params);
@@ -571,15 +566,12 @@ impl<'a> Rom<'a> {
             let data = read_file(path.join(config.file_name))?;
             let compressed = config.info.compressed;
             config.info.compressed = false;
-            let mut overlay = Overlay::new(
-                data,
-                OverlayOptions {
-                    info: config.info,
-                    originally_compressed: compressed,
-                    originally_signed: config.signed,
-                    dsprot_state: config.dsprot,
-                },
-            )?;
+            let mut overlay = Overlay::new(data, OverlayOptions {
+                info: config.info,
+                originally_compressed: compressed,
+                originally_signed: config.signed,
+                dsprot_state: config.dsprot,
+            })?;
 
             if overlay.dsprot_state().is_unencrypted() && options.encrypt {
                 log::info!("Encrypting DS Protect in {processor} overlay {}", overlay.id());
