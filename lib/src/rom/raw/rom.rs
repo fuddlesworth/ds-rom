@@ -128,6 +128,7 @@ impl<'a> Rom<'a> {
             build_info: build_info_offset,
             autoload_callback: header.arm9_autoload_callback,
             overlay_signatures: footer.map_or(0, |footer| footer.overlay_signatures_offset),
+            // A guess, as the autoload list is compressed. See `Arm9::detect_autoload_layout`
             twl_autoload_infos: header.unitcode != 0,
         })?)
     }

@@ -6,8 +6,8 @@ use snafu::{Backtrace, Snafu};
 use super::{
     Autoload, OverlayTable,
     raw::{
-        AutoloadInfo, AutoloadInfoEntry, AutoloadKind, BuildInfo, HmacSha1Signature, HmacSha1SignatureError, NITROCODE_BYTES,
-        RawAutoloadInfoError, RawBuildInfoError, TwlAutoloadInfoEntry,
+        AutoloadInfo, AutoloadInfoEntry, AutoloadInfoLayout, AutoloadKind, BuildInfo, HmacSha1Signature,
+        HmacSha1SignatureError, NITROCODE_BYTES, RawAutoloadInfoError, RawBuildInfoError, TwlAutoloadInfoEntry,
     },
 };
 use crate::{
@@ -503,6 +503,32 @@ impl<'a> Arm9<'a> {
         };
         build_info.compressed_code_end = base_address + length as u32;
         Ok(())
+    }
+
+    /// Detects the layout of the autoload list from its data, and sets [`Arm9Offsets::twl_autoload_infos`] to match. See
+    /// [`AutoloadInfoLayout::detect`].
+    ///
+    /// # Errors
+    ///
+    /// This function will return an error if [`Self::build_info`] or [`AutoloadInfoLayout::detect`] fails or this ARM9
+    /// program is compressed.
+    pub fn detect_autoload_layout(&mut self) -> Result<AutoloadInfoLayout, Arm9AutoloadError> {
+        let build_info = self.build_info()?;
+        if build_info.is_compressed() {
+            CompressedSnafu {}.fail()?;
+        }
+        let start = (build_info.autoload_infos_start - self.base_address()) as usize;
+        let end = (build_info.autoload_infos_end - self.base_address()) as usize;
+        // The autoload blocks are stored back to back, ending where the autoload list starts
+        let blocks_size = build_info.autoload_infos_start.checked_sub(build_info.autoload_blocks).unwrap_or(u32::MAX);
+        let layout = AutoloadInfoLayout::detect(&self.data[start..end], blocks_size)?;
+        self.offsets.twl_autoload_infos = layout == AutoloadInfoLayout::Twl;
+        Ok(layout)
+    }
+
+    /// Sets whether the autoload list uses the TWL-SDK format, see [`Arm9Offsets::twl_autoload_infos`].
+    pub fn set_twl_autoload_infos(&mut self, twl_autoload_infos: bool) {
+        self.offsets.twl_autoload_infos = twl_autoload_infos;
     }
 
     fn get_autoload_infos(&self, build_info: &BuildInfo) -> Result<Vec<AutoloadInfo>, Arm9AutoloadError> {

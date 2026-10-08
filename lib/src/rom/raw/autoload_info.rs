@@ -37,6 +37,82 @@ pub struct TwlAutoloadInfoEntry {
     pub bss_size: u32,
 }
 
+/// Layout of the entries in an autoload list. Which one a program uses depends on its SDK.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AutoloadInfoLayout {
+    /// 12-byte entries, see [`AutoloadInfoEntry`]. Used by the NITRO-SDK.
+    Basic,
+    /// 16-byte entries, see [`TwlAutoloadInfoEntry`]. Used by the TWL-SDK, in DSi-enhanced and DSi-exclusive titles.
+    Twl,
+}
+
+impl AutoloadInfoLayout {
+    /// All layouts, in the order they are tried when detecting the layout of an autoload list.
+    pub const ALL: [Self; 2] = [Self::Basic, Self::Twl];
+
+    /// Size of one autoload list entry in this layout.
+    pub fn entry_size(self) -> usize {
+        match self {
+            Self::Basic => size_of::<AutoloadInfoEntry>(),
+            Self::Twl => size_of::<TwlAutoloadInfoEntry>(),
+        }
+    }
+
+    /// Detects the layout of an autoload list. `blocks_size` is the combined size of the autoload blocks, which the code
+    /// sizes of the entries should add up to. This tells the layouts apart, as a list in one layout can otherwise be
+    /// misparsed in the other, for example a 48-byte list of three 16-byte or four 12-byte entries.
+    ///
+    /// If no layout's code sizes add up to `blocks_size`, the only layout whose entries are all plausible is used.
+    ///
+    /// # Errors
+    ///
+    /// This function will return an error if `data` is not a whole number of entries in any layout, or if no layout or
+    /// more than one layout is plausible and no layout's code sizes add up to `blocks_size`.
+    pub fn detect(data: &[u8], blocks_size: u32) -> Result<Self, RawAutoloadInfoError> {
+        let candidates = Self::ALL
+            .into_iter()
+            .filter(|layout| data.len().is_multiple_of(layout.entry_size()))
+            .map(|layout| (layout, AutoloadInfo::parse_list(data, layout)))
+            .collect::<Vec<_>>();
+        if candidates.is_empty() {
+            return NoLayoutSizeSnafu { size: data.len() }.fail();
+        }
+
+        // The code sizes adding up to the size of the autoload blocks is a strong signal that the layout is correct
+        let code_sizes = |infos: &[AutoloadInfo]| infos.iter().map(|info| info.code_size() as u64).sum::<u64>();
+        if let Some((layout, _)) = candidates.iter().find(|(_, infos)| code_sizes(infos) == blocks_size as u64) {
+            return Ok(*layout);
+        }
+
+        // The autoload blocks are not packed as expected, so fall back to the only plausible layout. If several are
+        // plausible, picking one could silently misparse the list
+        let plausible = candidates
+            .iter()
+            .filter(|(_, infos)| infos.iter().all(|info| info.list_entry.is_plausible()))
+            .map(|(layout, _)| *layout)
+            .collect::<Vec<_>>();
+        match plausible.as_slice() {
+            [layout] => {
+                log::warn!(
+                    "Autoload block sizes don't add up to {blocks_size:#x} bytes in any layout, assuming the {layout} layout"
+                );
+                Ok(*layout)
+            }
+            [] => NoMatchingLayoutSnafu { size: data.len(), expected_blocks_size: blocks_size }.fail(),
+            _ => AmbiguousLayoutSnafu { size: data.len(), count: plausible.len(), expected_blocks_size: blocks_size }.fail(),
+        }
+    }
+}
+
+impl Display for AutoloadInfoLayout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Basic => write!(f, "basic ({}-byte entries)", self.entry_size()),
+            Self::Twl => write!(f, "TWL-SDK ({}-byte entries)", self.entry_size()),
+        }
+    }
+}
+
 /// Autoload kind.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Deserialize, Serialize)]
 pub enum AutoloadKind {
@@ -103,6 +179,44 @@ pub enum RawAutoloadInfoError {
         /// Backtrace to the source of the error.
         backtrace: Backtrace,
     },
+    /// Occurs when the input cannot be divided into autoload list entries of any layout.
+    #[snafu(display(
+        "autoload infos are {size} bytes, which is not a multiple of 12 (basic layout) or 16 (TWL-SDK layout):\n{backtrace}"
+    ))]
+    NoLayoutSize {
+        /// Size of the input.
+        size: usize,
+        /// Backtrace to the source of the error.
+        backtrace: Backtrace,
+    },
+    /// Occurs when the input divides evenly into entries but no layout gives a plausible autoload list.
+    #[snafu(display(
+        "autoload infos of {size} bytes do not parse into a plausible autoload list in any layout, expected the code sizes \
+         to add up to {expected_blocks_size:#x} bytes of autoload blocks:\n{backtrace}"
+    ))]
+    NoMatchingLayout {
+        /// Size of the input.
+        size: usize,
+        /// Combined size of the autoload blocks, which the entries' code sizes should add up to.
+        expected_blocks_size: u32,
+        /// Backtrace to the source of the error.
+        backtrace: Backtrace,
+    },
+    /// Occurs when more than one layout parses plausibly and the autoload blocks don't tell them apart.
+    #[snafu(display(
+        "autoload infos of {size} bytes are ambiguous: they parse plausibly in {count} layouts but no layout's code sizes \
+         add up to {expected_blocks_size:#x} bytes of autoload blocks:\n{backtrace}"
+    ))]
+    AmbiguousLayout {
+        /// Size of the input.
+        size: usize,
+        /// Number of layouts that parsed plausibly.
+        count: usize,
+        /// Combined size of the autoload blocks, which the entries' code sizes should add up to.
+        expected_blocks_size: u32,
+        /// Backtrace to the source of the error.
+        backtrace: Backtrace,
+    },
     /// Occurs when the input is less aligned than [`AutoloadInfo`].
     #[snafu(display("expected {expected}-alignment for autoload infos but got {actual}-alignment:\n{backtrace}"))]
     Misaligned {
@@ -143,6 +257,16 @@ impl AutoloadInfoEntry {
     }
 }
 
+impl AutoloadInfoEntry {
+    /// Returns whether this entry could plausibly describe an autoload module. Used to rule out layouts when the autoload
+    /// blocks don't tell them apart.
+    fn is_plausible(&self) -> bool {
+        // Every memory region an autoload can be loaded into starts at 0x01000000 (ITCM) or above, and no module comes close
+        // to filling the DSi's 16MB of main RAM
+        self.base_address >= 0x01000000 && self.code_size < 0x01000000 && self.bss_size < 0x01000000
+    }
+}
+
 impl TwlAutoloadInfoEntry {
     /// Reinterprets a `&[u8]` as a slice of [`TwlAutoloadInfoEntry`].
     ///
@@ -172,6 +296,20 @@ impl AutoloadInfo {
         let TwlAutoloadInfoEntry { base_address, code_size, sinit_start, bss_size } = twl_entry;
         let list_entry = AutoloadInfoEntry { base_address, code_size, bss_size };
         Self { sinit_start: Some(sinit_start), ..Self::new(list_entry, index) }
+    }
+
+    /// Parses an autoload list in the given layout, see [`AutoloadInfoLayout::detect`]. Trailing bytes which don't make up a
+    /// whole entry are ignored.
+    pub fn parse_list(data: &[u8], layout: AutoloadInfoLayout) -> Vec<Self> {
+        let entries = data.chunks_exact(layout.entry_size()).enumerate();
+        match layout {
+            AutoloadInfoLayout::Basic => {
+                entries.map(|(index, entry)| Self::new(bytemuck::pod_read_unaligned(entry), index as u32)).collect()
+            }
+            AutoloadInfoLayout::Twl => {
+                entries.map(|(index, entry)| Self::new_twl(bytemuck::pod_read_unaligned(entry), index as u32)).collect()
+            }
+        }
     }
 
     /// Returns the raw bytes of this autoload's list entry, in the TWL-SDK format if [`Self::sinit_start`] is present.
@@ -245,5 +383,88 @@ impl Display for AutoloadKind {
             AutoloadKind::Unknown(index) => write!(f, "Unknown({index})"),
             AutoloadKind::Ltd(index) => write!(f, "Ltd({index})"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Autoload list of Pokémon Black Version 2, which uses the TWL-SDK layout.
+    const TWL: [u8; 64] = [
+        0x00, 0x80, 0xff, 0x01, 0xa0, 0x13, 0x00, 0x00, 0x00, 0x80, 0xff, 0x01, 0x00, 0x00, 0x00, 0x00, //
+        0x00, 0x00, 0xfe, 0x02, 0xa0, 0x00, 0x00, 0x00, 0x00, 0x00, 0xfe, 0x02, 0x20, 0x00, 0x00, 0x00, //
+        0x00, 0x00, 0x40, 0x02, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x02, 0x00, 0x00, 0x00, 0x00, //
+        0x00, 0x80, 0x89, 0x06, 0x20, 0x00, 0x00, 0x00, 0x00, 0x80, 0x89, 0x06, 0x00, 0x00, 0x00, 0x00,
+    ];
+
+    /// Autoload list in the basic layout, with an ITCM and a DTCM block.
+    const BASIC: [u8; 24] = [
+        0x00, 0x80, 0xff, 0x01, 0x00, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, //
+        0x00, 0x00, 0x7e, 0x02, 0x00, 0x10, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00,
+    ];
+
+    fn parse(data: &[u8], blocks_size: u32) -> Result<Vec<AutoloadInfo>, RawAutoloadInfoError> {
+        Ok(AutoloadInfo::parse_list(data, AutoloadInfoLayout::detect(data, blocks_size)?))
+    }
+
+    #[test]
+    fn parses_twl_layout() {
+        let infos = parse(&TWL, 0x1480).unwrap();
+        assert_eq!(infos.len(), 4);
+        assert_eq!(infos[0].list_entry, AutoloadInfoEntry { base_address: 0x01ff8000, code_size: 0x13a0, bss_size: 0 });
+        assert_eq!(infos[0].sinit_start, Some(0x01ff8000));
+        assert_eq!(infos[0].kind, AutoloadKind::Itcm);
+        assert_eq!(infos[1].base_address(), 0x02fe0000);
+        assert_eq!(infos[1].bss_size(), 0x20);
+        assert_eq!(infos[3].base_address(), 0x06898000);
+    }
+
+    #[test]
+    fn parses_basic_layout() {
+        let infos = parse(&BASIC, 0x3000).unwrap();
+        assert_eq!(infos.len(), 2);
+        assert_eq!(infos[0].list_entry, AutoloadInfoEntry { base_address: 0x01ff8000, code_size: 0x2000, bss_size: 0 });
+        assert_eq!(infos[1].list_entry, AutoloadInfoEntry { base_address: 0x027e0000, code_size: 0x1000, bss_size: 0x400 });
+        assert!(infos.iter().all(|info| info.sinit_start.is_none()));
+    }
+
+    /// A list of three TWL-SDK entries is 48 bytes, which also divides into four basic entries. The size of the autoload
+    /// blocks has to break the tie.
+    #[test]
+    fn tells_ambiguous_sizes_apart() {
+        let infos = parse(&TWL[..48], 0x1460).unwrap();
+        assert_eq!(infos.len(), 3);
+        assert_eq!(infos[2].base_address(), 0x02400000);
+        assert!(infos.iter().all(|info| info.sinit_start.is_some()));
+    }
+
+    #[test]
+    fn round_trips_both_layouts() {
+        for (data, blocks_size) in [(&TWL[..], 0x1480), (&BASIC[..], 0x3000)] {
+            let infos = parse(data, blocks_size).unwrap();
+            let bytes = infos.iter().flat_map(|info| info.entry_bytes()).collect::<Vec<_>>();
+            assert_eq!(bytes, data);
+        }
+    }
+
+    #[test]
+    fn rejects_sizes_that_are_no_layout() {
+        let error = parse(&TWL[..20], 0x1480).unwrap_err();
+        assert!(matches!(error, RawAutoloadInfoError::NoLayoutSize { .. }));
+    }
+
+    /// When no layout's code sizes add up to the autoload blocks but exactly one layout parses plausibly, that layout is
+    /// used. The 64-byte list only divides into TWL-SDK entries.
+    #[test]
+    fn falls_back_to_the_only_plausible_layout() {
+        assert_eq!(parse(&TWL, 0x9999).unwrap(), parse(&TWL, 0x1480).unwrap());
+    }
+
+    /// The only layout is rejected if its entries are implausible and its code sizes don't add up.
+    #[test]
+    fn rejects_the_only_layout_when_implausible() {
+        let error = parse(&[0u8; 12], 0x100).unwrap_err();
+        assert!(matches!(error, RawAutoloadInfoError::NoMatchingLayout { .. }));
     }
 }

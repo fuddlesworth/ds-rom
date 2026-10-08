@@ -836,6 +836,9 @@ impl<'a> Rom<'a> {
         let mut arm9 = rom.arm9()?;
         let mut decompressed_arm9 = arm9.clone();
         decompressed_arm9.decompress()?;
+        // The layout of the autoload list can only be read from the decompressed program
+        let autoload_layout = decompressed_arm9.detect_autoload_layout()?;
+        arm9.set_twl_autoload_infos(autoload_layout == raw::AutoloadInfoLayout::Twl);
 
         let arm9_overlays = rom.arm9_overlay_table_with(&decompressed_arm9)?;
         let mut arm9_overlays = OverlayTable::parse_arm9(arm9_overlays, rom, &decompressed_arm9)?;

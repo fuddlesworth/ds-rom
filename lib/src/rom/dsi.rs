@@ -7,7 +7,7 @@ use snafu::{Backtrace, Snafu};
 use super::{
     Arm9, Autoload, Digest, DigestError, DigestParams,
     digest::{DIGEST_HASH_SIZE, DigestHash},
-    raw::{self, AutoloadInfo, AutoloadKind, ProgramOffset, RawHeaderError, TableOffset, TwlAutoloadInfoEntry},
+    raw::{self, AutoloadInfo, AutoloadInfoLayout, AutoloadKind, ProgramOffset, RawHeaderError, TableOffset},
 };
 use crate::{
     compress::lz77::{Lz77, Lz77DecompressError},
@@ -608,14 +608,15 @@ impl<'a> Ltd<'a> {
             return Ok(None);
         }
 
+        let list = &image[list_start..list_end];
+        let Ok(layout) = AutoloadInfoLayout::detect(list, (list_start - autoload_start) as u32) else {
+            return Ok(None);
+        };
         let mut autoloads = vec![];
         let mut offset = autoload_start;
-        let entries = image[list_start..list_end].chunks_exact(size_of::<TwlAutoloadInfoEntry>());
-        for (index, entry) in entries.enumerate() {
-            let entry: TwlAutoloadInfoEntry = bytemuck::pod_read_unaligned(entry);
-            let mut info = AutoloadInfo::new_twl(entry, index as u32);
+        for (index, mut info) in AutoloadInfo::parse_list(list, layout).into_iter().enumerate() {
             info.kind = AutoloadKind::Ltd(index as u32);
-            let end = offset + entry.code_size as usize;
+            let end = offset + info.code_size() as usize;
             if end > list_start {
                 return Ok(None);
             }
