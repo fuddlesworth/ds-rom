@@ -771,6 +771,15 @@ mod tests {
         }
     }
 
+    /// The unit code alone does not make a DSi area, the ARM9i program must be present too
+    #[test]
+    fn needs_arm9i_for_dsi_area() {
+        let rom = dsi_rom(|header| header.arm9i.size = 0);
+        assert!(matches!(Dsi::extract(&rom), Ok(None)));
+        let rom = dsi_rom(|header| header.unitcode = 0);
+        assert!(matches!(Dsi::extract(&rom), Ok(None)));
+    }
+
     #[test]
     fn rejects_out_of_bounds_dsi_area() {
         let rom = dsi_rom(|header| {
