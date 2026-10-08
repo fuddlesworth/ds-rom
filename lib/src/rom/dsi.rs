@@ -176,6 +176,36 @@ pub enum DsiError {
         /// Source error.
         source: io::Error,
     },
+    /// Occurs when a section of the DSi area described by the header does not fit in the ROM.
+    #[snafu(display(
+        "the DSi header's {section} at {start:#x}..{end:#x} does not fit in the ROM of {rom_size:#x} bytes:\n{backtrace}"
+    ))]
+    DsiAreaOutOfBounds {
+        /// Name of the section.
+        section: &'static str,
+        /// Start of the section.
+        start: usize,
+        /// End of the section.
+        end: usize,
+        /// Size of the ROM.
+        rom_size: usize,
+        /// Backtrace to the source of the error.
+        backtrace: Backtrace,
+    },
+    /// Occurs when a DSi header offset which must point into the ROM is zero.
+    #[snafu(display("DSi header offset {field} is zero but must point into the ROM:\n{backtrace}"))]
+    DsiAreaOffsetZero {
+        /// Name of the offending offset.
+        field: &'static str,
+        /// Backtrace to the source of the error.
+        backtrace: Backtrace,
+    },
+    /// Occurs when the header's digest sector size or sector count is zero.
+    #[snafu(display("the DSi header's digest sector size and sector count must both be nonzero:\n{backtrace}"))]
+    DigestSizeZero {
+        /// Backtrace to the source of the error.
+        backtrace: Backtrace,
+    },
     /// Occurs when the stored secure area digests don't cover the secure area.
     #[snafu(display("expected {expected} secure area sector digests but got {actual}:\n{backtrace}"))]
     WrongSecureAreaDigestCount {
@@ -298,9 +328,32 @@ impl<'a> Dsi<'a> {
             return DebugModcryptSnafu {}.fail();
         }
 
+        // The DSi header fields are only trustworthy if they point into the ROM, so check them instead of panicking on a
+        // malformed header
+        let sector_size = header.digest_sector_size;
+        if sector_size == 0 || header.digest_sector_count == 0 {
+            return DigestSizeZeroSnafu {}.fail();
+        }
+        let dsi_region_start = header.dsi_rom_region_end as usize * DSI_REGION_ALIGNMENT as usize;
+        for (field, offset) in [
+            ("digest_sector_hashtable", header.digest_sector_hashtable.offset as usize),
+            ("dsi_rom_region_end", dsi_region_start),
+            ("arm9i", header.arm9i.offset as usize),
+        ]
+        .into_iter()
+        .chain((header.arm7i.size != 0).then_some(("arm7i", header.arm7i.offset as usize)))
+        {
+            if offset == 0 {
+                return DsiAreaOffsetZeroSnafu { field }.fail();
+            }
+        }
+
         let data = rom.data();
-        let mut arm9i = data[program_range(&header.arm9i)].to_vec();
-        let mut arm7i = data[program_range(&header.arm7i)].to_vec();
+        let arm9 = dsi_area(data, "arm9", program_range(&header.arm9))?;
+        let mut arm9i = dsi_area(data, "arm9i", program_range(&header.arm9i))?.to_vec();
+        let mut arm7i = dsi_area(data, "arm7i", program_range(&header.arm7i))?.to_vec();
+        let sector_table = dsi_area(data, "digest_sector_hashtable", table_range(&header.digest_sector_hashtable))?;
+        let region_prefix = dsi_area(data, "dsi_region", dsi_region_start..header.arm9i.offset as usize)?.to_vec();
 
         let modcrypt = Modcrypt::new_retail(header.gamecode.0, &header.sha1_hmac_arm9i);
         let arm9i_modcrypt_size = modcrypt_size(1, &header.modcrypt_area_1, "ARM9i", &header.arm9i, &mut arm9i, |data| {
@@ -311,17 +364,12 @@ impl<'a> Dsi<'a> {
         })?;
 
         // The digest tables start with the DS area, so the first sectors belong to the secure area
-        let sector_size = header.digest_sector_size;
         let num_secure_sectors = SECURE_AREA_ENCRYPTED_SIZE.div_ceil(sector_size) as usize;
-        let sector_table = &data[table_range(&header.digest_sector_hashtable)];
         let sector_digests = sector_table.as_chunks::<DIGEST_SIZE>().0.iter().take(num_secure_sectors).copied().collect();
-
-        let dsi_region_start = header.dsi_rom_region_end as usize * DSI_REGION_ALIGNMENT as usize;
-        let region_prefix = data[dsi_region_start..header.arm9i.offset as usize].to_vec();
 
         // The LTD module parameters are stored before the compressed part of the ARM9 program, so they can be read as-is
         let ltd_params = (header.arm9i_build_info_offset < ARM9_COMPRESSION_START)
-            .then(|| LtdModuleParams::from_arm9(&data[program_range(&header.arm9)], header.arm9i_build_info_offset))
+            .then(|| LtdModuleParams::from_arm9(arm9, header.arm9i_build_info_offset))
             .flatten();
         let ltd = match ltd_params {
             Some(params) => Ltd::split(&arm9i, header.arm9i.base_addr, &params)?,
@@ -608,11 +656,19 @@ impl LtdModuleParams {
 }
 
 fn program_range(program: &ProgramOffset) -> Range<usize> {
-    program.offset as usize..(program.offset + program.size) as usize
+    program.offset as usize..program.offset as usize + program.size as usize
 }
 
 fn table_range(table: &TableOffset) -> Range<usize> {
-    table.offset as usize..(table.offset + table.size) as usize
+    table.offset as usize..table.offset as usize + table.size as usize
+}
+
+/// Returns a section of the ROM which the header points to, or an error if it does not fit in the ROM.
+fn dsi_area<'d>(data: &'d [u8], section: &'static str, range: Range<usize>) -> Result<&'d [u8], DsiError> {
+    match data.get(range.clone()) {
+        Some(section) => Ok(section),
+        None => DsiAreaOutOfBoundsSnafu { section, start: range.start, end: range.end, rom_size: data.len() }.fail(),
+    }
 }
 
 fn modcrypt_area(program: &ProgramOffset, size: u32) -> TableOffset {
@@ -684,5 +740,54 @@ mod hex_digests {
 
     pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<Digest>, D::Error> {
         Vec::<String>::deserialize(deserializer)?.iter().map(|s| from_hex(s).map_err(D::Error::custom)).collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A ROM whose header marks it as DSi-enhanced
+    fn dsi_rom(edit: impl FnOnce(&mut raw::Header)) -> raw::Rom<'static> {
+        // The header parser needs the 0x4000-byte header and secure area region before it hands back a header
+        let mut data = vec![0u8; 0x4000];
+        let header: &mut raw::Header = bytemuck::from_bytes_mut(&mut data[..size_of::<raw::Header>()]);
+        header.unitcode = 2;
+        header.arm9i.size = 0x100;
+        header.digest_sector_size = 0x400;
+        header.digest_sector_count = 0x20;
+        edit(header);
+        raw::Rom::new(data)
+    }
+
+    /// A DSi header whose section offsets are zero must be rejected with an error rather than a panic, so a crafted ROM
+    /// cannot crash the extractor. Adapted from AetiasHax/ds-rom#30 by Thomas Macmillan.
+    #[test]
+    fn rejects_zero_dsi_offsets() {
+        match Dsi::extract(&dsi_rom(|_| {})) {
+            Err(DsiError::DsiAreaOffsetZero { field: "digest_sector_hashtable", .. }) => {}
+            Err(other) => panic!("expected a zero-offset error, got {other:?}"),
+            Ok(_) => panic!("expected extraction of a zeroed header to fail"),
+        }
+    }
+
+    #[test]
+    fn rejects_out_of_bounds_dsi_area() {
+        let rom = dsi_rom(|header| {
+            header.digest_sector_hashtable = TableOffset { offset: 0x3000, size: 0x100 };
+            header.dsi_rom_region_end = 1;
+            header.arm9i.offset = 0x80000;
+        });
+        match Dsi::extract(&rom) {
+            Err(DsiError::DsiAreaOutOfBounds { section: "arm9i", .. }) => {}
+            Err(other) => panic!("expected an out-of-bounds error, got {other:?}"),
+            Ok(_) => panic!("expected extraction of an out-of-bounds DSi area to fail"),
+        }
+    }
+
+    #[test]
+    fn rejects_zero_digest_sizes() {
+        let rom = dsi_rom(|header| header.digest_sector_size = 0);
+        assert!(matches!(Dsi::extract(&rom), Err(DsiError::DigestSizeZero { .. })));
     }
 }
