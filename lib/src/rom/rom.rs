@@ -59,6 +59,12 @@ pub enum RomExtractError {
         /// Source error.
         source: DsiError,
     },
+    /// Occurs when a DSi ROM has no ARM9 HMAC-SHA1 key, which is needed to build its digests and SHA1-HMACs.
+    #[snafu(display("the DSi ROM has no ARM9 HMAC-SHA1 key, which is needed to rebuild its digests:\n{backtrace}"))]
+    NoDsiHmacSha1Key {
+        /// Backtrace to the source of the error.
+        backtrace: Backtrace,
+    },
     /// See [`RawHeaderError`].
     #[snafu(transparent)]
     RawHeader {
@@ -177,6 +183,22 @@ pub enum RomBuildError {
     Dsi {
         /// Source error.
         source: DsiError,
+    },
+    /// Occurs when only one of the header's DSi section and the ROM's DSi area is present.
+    #[snafu(display(
+        "a DSi ROM needs both a DSi header section and a DSi area, but only the {present} is present:\n{backtrace}"
+    ))]
+    DsiIncomplete {
+        /// The part which is present.
+        present: &'static str,
+        /// Backtrace to the source of the error.
+        backtrace: Backtrace,
+    },
+    /// Occurs when building a DSi ROM without the ARM9 HMAC-SHA1 key, which is needed for its digests and SHA1-HMACs.
+    #[snafu(display("the ARM9 HMAC-SHA1 key is needed to build DSi ROMs:\n{backtrace}"))]
+    DsiHmacSha1KeyNeeded {
+        /// Backtrace to the source of the error.
+        backtrace: Backtrace,
     },
     /// See [`io::Error`].
     #[snafu(transparent)]
@@ -841,6 +863,9 @@ impl<'a> Rom<'a> {
         let has_arm9_hmac_sha1 = arm9_hmac_sha1_key.is_some();
         let arm9_footer = rom.arm9_footer_opt().map_err(RawArm9Error::from)?.is_some();
         let dsi = Dsi::extract(rom)?;
+        if dsi.is_some() && !has_arm9_hmac_sha1 {
+            return NoDsiHmacSha1KeySnafu {}.fail();
+        }
 
         let multiboot_signature = rom.multiboot_signature()?;
 
@@ -934,8 +959,16 @@ impl<'a> Rom<'a> {
     ///
     /// # Errors
     ///
-    /// This function will return an error if an I/O operation fails or a component fails to build.
+    /// This function will return an error if an I/O operation fails or a component fails to build, or if a DSi ROM is
+    /// incomplete or lacks its ARM9 HMAC-SHA1 key.
     pub fn build(mut self, key: Option<&BlowfishKey>) -> Result<raw::Rom<'a>, RomBuildError> {
+        match (&self.header.dsi, &self.dsi) {
+            (Some(_), None) => return DsiIncompleteSnafu { present: "header's DSi section" }.fail(),
+            (None, Some(_)) => return DsiIncompleteSnafu { present: "DSi area" }.fail(),
+            (Some(_), Some(_)) if self.hmac_sha1.is_none() => return DsiHmacSha1KeyNeededSnafu {}.fail(),
+            _ => {}
+        }
+
         let mut context = BuildContext { blowfish_key: key, ..Default::default() };
 
         let mut cursor = Cursor::new(Vec::with_capacity(128 * 1024)); // smallest possible ROM
