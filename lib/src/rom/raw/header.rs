@@ -240,9 +240,10 @@ impl Header {
         self.unitcode & 0x2 != 0 && self.arm9i.size != 0
     }
 
-    /// Returns whether the modcrypt areas are encrypted with the debug key instead of the retail key.
+    /// Returns whether the ROM is modcrypted with the debug key instead of the retail key. The debug key flag means nothing
+    /// if the ROM is not modcrypted.
     pub fn uses_modcrypt_debug_key(&self) -> bool {
-        self.dsi_flags.modcrypt_debug_key()
+        self.dsi_flags.modcrypted() && self.dsi_flags.modcrypt_debug_key()
     }
 
     /// Returns the version of this [`Header`].
@@ -403,13 +404,13 @@ impl Display for Capacity {
 #[bitfield(u8)]
 pub struct DsiFlags {
     /// If `true`, the ROM has a DSi area.
-    dsi_title: bool,
+    pub dsi_title: bool,
     /// If `true`, the ROM is modcrypted.
-    modcrypted: bool,
+    pub modcrypted: bool,
     /// If `true`, use debug key, otherwise retail key.
-    modcrypt_debug_key: bool,
+    pub modcrypt_debug_key: bool,
     /// Disable debug?
-    disable_debug: bool,
+    pub disable_debug: bool,
     /// Reserved, zero.
     #[bits(4)]
     reserved: u8,

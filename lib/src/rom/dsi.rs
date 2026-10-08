@@ -746,6 +746,7 @@ mod hex_digests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rom::raw::DsiFlags;
 
     /// A ROM whose header marks it as DSi-enhanced
     fn dsi_rom(edit: impl FnOnce(&mut raw::Header)) -> raw::Rom<'static> {
@@ -792,6 +793,17 @@ mod tests {
             Err(other) => panic!("expected an out-of-bounds error, got {other:?}"),
             Ok(_) => panic!("expected extraction of an out-of-bounds DSi area to fail"),
         }
+    }
+
+    /// Only a ROM which is both modcrypted and flagged for the debug key is rejected
+    #[test]
+    fn rejects_only_modcrypted_debug_key() {
+        let debug_key = DsiFlags::new().with_modcrypt_debug_key(true);
+        let rom = dsi_rom(|header| header.dsi_flags = debug_key.with_modcrypted(true));
+        assert!(matches!(Dsi::extract(&rom), Err(DsiError::DebugModcrypt { .. })));
+        // Fails later, at the zero offsets, instead
+        let rom = dsi_rom(|header| header.dsi_flags = debug_key);
+        assert!(matches!(Dsi::extract(&rom), Err(DsiError::DsiAreaOffsetZero { .. })));
     }
 
     #[test]
