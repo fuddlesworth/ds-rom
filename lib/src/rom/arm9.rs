@@ -54,6 +54,18 @@ fn is_false(value: &bool) -> bool {
 }
 
 const SECURE_AREA_ID: [u8; 8] = [0xff, 0xde, 0xff, 0xe7, 0xff, 0xde, 0xff, 0xe7];
+
+/// Returns whether the secure area at the start of an ARM9 program is encrypted, see [`Arm9::is_encrypted`].
+pub(crate) fn is_secure_area_encrypted(data: &[u8]) -> bool {
+    if data.len() >= 8 && data[0..8] == SECURE_AREA_ID {
+        false
+    } else if data.len() >= 0x800 {
+        let zero_count = data[0..0x800].iter().filter(|&&b| b == 0).count();
+        zero_count < SECURE_AREA_UNENCRYPTED_THRESHOLD
+    } else {
+        true
+    }
+}
 const SECURE_AREA_ENCRY_OBJ: &[u8] = "encryObj".as_bytes();
 
 /// Number of zero-bytes in the secure area for it to be considered unencrypted. This applies to a
@@ -304,14 +316,7 @@ impl<'a> Arm9<'a> {
     /// Returns whether the secure area is encrypted. See [`Self::originally_encrypted`] for whether the secure area was
     /// encrypted originally.
     pub fn is_encrypted(&self) -> bool {
-        if self.data.len() >= 8 && self.data[0..8] == SECURE_AREA_ID {
-            false
-        } else if self.data.len() >= 0x800 {
-            let zero_count = self.data[0..0x800].iter().filter(|&&b| b == 0).count();
-            zero_count < SECURE_AREA_UNENCRYPTED_THRESHOLD
-        } else {
-            true
-        }
+        is_secure_area_encrypted(&self.data)
     }
 
     /// Decrypts the secure area. Does nothing if already decrypted.

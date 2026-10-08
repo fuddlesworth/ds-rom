@@ -6,7 +6,7 @@ use std::{
 use anyhow::{Result, anyhow};
 use ds_rom::{
     crypto::{blowfish::BlowfishKey, hmac_sha1::HmacSha1, modcrypt::Modcrypt},
-    rom::{Rom, RomBuildError, RomLoadOptions, raw},
+    rom::{DsiError, Rom, RomBuildError, RomLoadOptions, raw},
 };
 
 use crate::common::RomsTest;
@@ -200,6 +200,15 @@ fn test_dsi_hashes_are_regenerated() -> Result<()> {
         }
         let before = assert_self_consistent(&original, &test.key, "unmodified")?;
 
+        // Configs extracted before the plaintext secure area hash was stored still build
+        let dsi_config = extract_path.join("dsi/dsi.yaml");
+        let dsi_yaml = fs::read_to_string(&dsi_config)?;
+        assert!(dsi_yaml.contains("plaintext_sha1: "), "{file_name}: no plaintext secure area hash stored");
+        let old_yaml = dsi_yaml.lines().filter(|line| !line.contains("plaintext_sha1: ")).collect::<Vec<_>>().join("\n");
+        fs::write(&dsi_config, old_yaml)?;
+        assert!(build(&extract_path, None)? == original, "{file_name}: old config did not rebuild");
+        fs::write(&dsi_config, dsi_yaml)?;
+
         // Change the DS area, the banner and the ARM9i, and check that the hashes follow the new contents. Changing the
         // ARM9i also changes the modcrypt key, which is derived from the ARM9i hash
         let ltd_autoload = extract_path.join("dsi/ltd_autoload_0.bin");
@@ -220,6 +229,25 @@ fn test_dsi_hashes_are_regenerated() -> Result<()> {
 
         // The ARM9 is unchanged, so building with the stored secure area values must give the same ROM as with the key
         let modified = build(&extract_path, Some(&test.key))?;
+
+        // Without the key, the stored secure area values are used, which are stale if the secure area changed. The secure
+        // area holds the LTD module parameters, which change with the size of the compressed ARM9i
+        let secure_area = |rom: &[u8]| -> Result<Vec<u8>> {
+            let header = raw::Rom::new(rom).header()?.arm9;
+            Ok(rom[header.offset as usize..][..0x4000].to_vec())
+        };
+        let rom = Rom::load(extract_path.join("config.yaml"), RomLoadOptions::default())?;
+        match rom.build(None) {
+            Err(RomBuildError::Dsi { source: DsiError::SecureAreaChanged { .. } }) => {
+                assert!(secure_area(&modified)? != secure_area(&original)?, "{file_name}: secure area changed falsely");
+                println!("{file_name}: building without the key failed, as the secure area changed");
+            }
+            Err(error) => return Err(error.into()),
+            Ok(rom) => {
+                assert!(secure_area(&modified)? == secure_area(&original)?, "{file_name}: secure area change not noticed");
+                assert!(rom.data() == modified, "{file_name}: modified ROM depends on the Blowfish key");
+            }
+        }
         assert_eq!(modified.len(), original.len(), "{file_name}: modified ROM changed size");
         assert!(modified != original, "{file_name}: modified ROM is identical to the original");
         let after = assert_self_consistent(&modified, &test.key, "modified")?;
@@ -232,8 +260,7 @@ fn test_dsi_hashes_are_regenerated() -> Result<()> {
         assert_ne!(before.arm9i, after.arm9i, "ARM9i hash did not change");
         assert_ne!(before.banner, after.banner, "banner hash did not change");
 
-        // The ARM9 outside the secure area, the ARM7 and the ARM7i are unchanged, so their hashes must be too. The secure area
-        // holds the LTD module parameters, which change with the size of the compressed ARM9i
+        // The ARM9 outside the secure area, the ARM7 and the ARM7i are unchanged, so their hashes must be too
         assert_eq!(before.arm9, after.arm9, "ARM9 hash changed");
         assert_eq!(before.arm7, after.arm7, "ARM7 hash changed");
         assert_eq!(before.arm7i, after.arm7i, "ARM7i hash changed");

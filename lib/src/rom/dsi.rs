@@ -2,10 +2,12 @@ use std::{borrow::Cow, io, mem::size_of, ops::Range};
 
 use bytemuck::{Pod, Zeroable};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
+use sha1::{Digest as _, Sha1};
 use snafu::{Backtrace, Snafu};
 
 use super::{
     Arm9, Autoload, Digest, DigestError, DigestParams,
+    arm9::is_secure_area_encrypted,
     digest::{DIGEST_HASH_SIZE, DigestHash},
     raw::{self, AutoloadInfo, AutoloadInfoLayout, AutoloadKind, ProgramOffset, RawHeaderError, TableOffset},
 };
@@ -116,6 +118,11 @@ pub struct SecureAreaValues {
     /// Digests of the sectors which overlap the encrypted secure area.
     #[serde(with = "hex_digests")]
     pub sector_digests: Vec<DigestHash>,
+    /// SHA1 of the plaintext secure area these values were derived from, the first 0x4000 bytes of the ARM9 program. If the
+    /// secure area changes, these values are stale, so building fails unless the Blowfish key is given to compute them
+    /// again. Absent in configs extracted before this was added, which are not checked.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "hex_digest_opt")]
+    pub plaintext_sha1: Option<DigestHash>,
 }
 
 /// Errors related to [`Dsi`].
@@ -160,6 +167,17 @@ pub enum DsiError {
         "the secure area is unencrypted, so a Blowfish key or secure area values are needed to build the digests:\n{backtrace}"
     ))]
     NoSecureAreaValues {
+        /// Backtrace to the source of the error.
+        backtrace: Backtrace,
+    },
+    /// Occurs when building without a Blowfish key, with stored secure area values which are stale because the plaintext
+    /// secure area changed since they were extracted.
+    #[snafu(display(
+        "the ARM9 secure area (its first 0x4000 bytes) has changed since extracting, so the secure area values stored in the \
+         DSi config are stale. Provide the ARM7 BIOS so the Blowfish key can encrypt the secure area and compute them \
+         again:\n{backtrace}"
+    ))]
+    SecureAreaChanged {
         /// Backtrace to the source of the error.
         backtrace: Backtrace,
     },
@@ -400,6 +418,8 @@ impl<'a> Dsi<'a> {
                 crc: header.secure_area_crc,
                 sha1_hmac_arm9_with_secure_area: header.sha1_hmac_arm9_with_secure_area,
                 sector_digests,
+                // An encrypted secure area can't be decrypted here, but it is not built from these values either
+                plaintext_sha1: (!is_secure_area_encrypted(arm9)).then(|| secure_area_sha1(arm9)),
             }),
             ltd: ltd.as_ref().map(|_| LtdConfig { compressed: ltd_params.is_some_and(|p| p.compressed_static_end != 0) }),
         };
@@ -521,6 +541,11 @@ impl<'a> Dsi<'a> {
         } else {
             self.config.secure_area.as_ref()
         };
+        if let Some(plaintext_sha1) = stored_secure_area.and_then(|values| values.plaintext_sha1)
+            && secure_area_sha1(arm9_data) != plaintext_sha1
+        {
+            return SecureAreaChangedSnafu {}.fail();
+        }
 
         // --------------------- Digests ---------------------
         // The secure area is at the start of the DS area, see `layout`. Its sectors are hashed in their encrypted form
@@ -703,6 +728,11 @@ fn modcrypt_size(
     Ok(modcrypt_area.size)
 }
 
+/// Returns the SHA1 of the plaintext secure area of an ARM9 program, see [`SecureAreaValues::plaintext_sha1`].
+fn secure_area_sha1(arm9: &[u8]) -> DigestHash {
+    Sha1::digest(&arm9[..SECURE_AREA_SIZE.min(arm9.len())]).into()
+}
+
 fn to_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -727,6 +757,21 @@ mod hex_digest {
 
     pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<DigestHash, D::Error> {
         from_hex(&String::deserialize(deserializer)?).map_err(D::Error::custom)
+    }
+}
+
+mod hex_digest_opt {
+    use super::*;
+
+    pub fn serialize<S: Serializer>(digest: &Option<DigestHash>, serializer: S) -> Result<S::Ok, S::Error> {
+        match digest {
+            Some(digest) => serializer.serialize_some(&to_hex(digest)),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<DigestHash>, D::Error> {
+        Option::<String>::deserialize(deserializer)?.map(|s| from_hex(&s).map_err(D::Error::custom)).transpose()
     }
 }
 
@@ -792,6 +837,22 @@ mod tests {
             Err(other) => panic!("expected an out-of-bounds error, got {other:?}"),
             Ok(_) => panic!("expected extraction of an out-of-bounds DSi area to fail"),
         }
+    }
+
+    /// Configs extracted before `plaintext_sha1` was added still load, and it is only written when present
+    #[test]
+    fn loads_secure_area_values_without_plaintext_sha1() {
+        let yaml = "crc: 30469\nsha1_hmac_arm9_with_secure_area: 73fbb3addb0e7236e32a5a87d8b24843fdd630d2\nsector_digests:\n  - \
+                    5c609b719411d6aa1986f7564506919ae9b5b843\n";
+        let mut values: SecureAreaValues = serde_saphyr::from_str(yaml).unwrap();
+        assert_eq!(values.plaintext_sha1, None);
+        assert_eq!(serde_saphyr::to_string(&values).unwrap(), yaml);
+
+        values.plaintext_sha1 = Some([0xab; DIGEST_SIZE]);
+        let yaml = serde_saphyr::to_string(&values).unwrap();
+        assert!(yaml.contains(&format!("plaintext_sha1: {}", "ab".repeat(DIGEST_SIZE))), "{yaml}");
+        let values: SecureAreaValues = serde_saphyr::from_str(&yaml).unwrap();
+        assert_eq!(values.plaintext_sha1, Some([0xab; DIGEST_SIZE]));
     }
 
     /// Only a ROM which is both modcrypted and flagged for the debug key is rejected
