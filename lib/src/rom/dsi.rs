@@ -5,7 +5,8 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 use snafu::{Backtrace, Snafu};
 
 use super::{
-    Arm9, Autoload,
+    Arm9, Autoload, Digest, DigestError, DigestParams,
+    digest::{DIGEST_HASH_SIZE, DigestHash},
     raw::{self, AutoloadInfo, AutoloadKind, ProgramOffset, RawHeaderError, TableOffset, TwlAutoloadInfoEntry},
 };
 use crate::{
@@ -28,9 +29,7 @@ const DSI_TABLE_ALIGNMENT: u32 = 0x200;
 /// The DSi region starts at a multiple of this alignment.
 const DSI_REGION_ALIGNMENT: u32 = 0x80000;
 /// Size of a SHA1 digest.
-const DIGEST_SIZE: usize = 0x14;
-
-type Digest = [u8; DIGEST_SIZE];
+const DIGEST_SIZE: usize = DIGEST_HASH_SIZE;
 
 /// DSi-specific parts of a DSi-enhanced or DSi-exclusive ROM. The ARM9i and ARM7i programs are stored decrypted.
 #[derive(Clone)]
@@ -113,10 +112,10 @@ pub struct SecureAreaValues {
     pub crc: u16,
     /// SHA1-HMAC of the ARM9 program with the encrypted secure area.
     #[serde(with = "hex_digest")]
-    pub sha1_hmac_arm9_with_secure_area: Digest,
+    pub sha1_hmac_arm9_with_secure_area: DigestHash,
     /// Digests of the sectors which overlap the encrypted secure area.
     #[serde(with = "hex_digests")]
-    pub sector_digests: Vec<Digest>,
+    pub sector_digests: Vec<DigestHash>,
 }
 
 /// Errors related to [`Dsi`].
@@ -206,6 +205,12 @@ pub enum DsiError {
         /// Backtrace to the source of the error.
         backtrace: Backtrace,
     },
+    /// See [`DigestError`].
+    #[snafu(transparent)]
+    Digest {
+        /// Source error.
+        source: DigestError,
+    },
     /// Occurs when the stored secure area digests don't cover the secure area.
     #[snafu(display("expected {expected} secure area sector digests but got {actual}:\n{backtrace}"))]
     WrongSecureAreaDigestCount {
@@ -249,19 +254,19 @@ pub struct DsiHeaderValues {
     /// CRC checksum of the encrypted secure area, if known.
     pub secure_area_crc: Option<u16>,
     /// SHA1-HMAC of the ARM9 program with the encrypted secure area.
-    pub sha1_hmac_arm9_with_secure_area: Digest,
+    pub sha1_hmac_arm9_with_secure_area: DigestHash,
     /// SHA1-HMAC of the ARM7 program.
-    pub sha1_hmac_arm7: Digest,
+    pub sha1_hmac_arm7: DigestHash,
     /// SHA1-HMAC of the block digest hashtable.
-    pub sha1_hmac_digest: Digest,
+    pub sha1_hmac_digest: DigestHash,
     /// SHA1-HMAC of the banner.
-    pub sha1_hmac_banner: Digest,
+    pub sha1_hmac_banner: DigestHash,
     /// SHA1-HMAC of the decrypted ARM9i program.
-    pub sha1_hmac_arm9i: Digest,
+    pub sha1_hmac_arm9i: DigestHash,
     /// SHA1-HMAC of the decrypted ARM7i program.
-    pub sha1_hmac_arm7i: Digest,
+    pub sha1_hmac_arm7i: DigestHash,
     /// SHA1-HMAC of the ARM9 program excluding the secure area.
-    pub sha1_hmac_arm9: Digest,
+    pub sha1_hmac_arm9: DigestHash,
     /// Modcrypt area 1, covering the ARM9i program.
     pub modcrypt_area_1: TableOffset,
     /// Modcrypt area 2, covering the ARM7i program.
@@ -517,20 +522,14 @@ impl<'a> Dsi<'a> {
             self.config.secure_area.as_ref()
         };
 
-        // --------------------- Sector digests ---------------------
-        let mut sector_digests: Vec<Digest> = Vec::with_capacity(layout.digest_sector_hashtable.size as usize / DIGEST_SIZE);
-        for sector in rom[table_range(&layout.digest_ds_area)].chunks(sector_size) {
-            sector_digests.push(hmac_sha1.compute(sector));
-        }
+        // --------------------- Digests ---------------------
+        // The secure area is at the start of the DS area, see `layout`. Its sectors are hashed in their encrypted form
         let num_secure_sectors = SECURE_AREA_ENCRYPTED_SIZE.div_ceil(self.config.digest_sector_size) as usize;
-        if let Some(secure_area) = &encrypted_secure_area {
-            // The secure area is at the start of the DS area, see `layout`
+        let secure_sectors = if let Some(secure_area) = &encrypted_secure_area {
             let mut sectors = rom[arm9_offset as usize..arm9_offset as usize + num_secure_sectors * sector_size].to_vec();
             sectors[..SECURE_AREA_ENCRYPTED_SIZE as usize]
                 .copy_from_slice(&secure_area[..SECURE_AREA_ENCRYPTED_SIZE as usize]);
-            for (digest, sector) in sector_digests.iter_mut().zip(sectors.chunks(sector_size)) {
-                *digest = hmac_sha1.compute(sector);
-            }
+            sectors.chunks(sector_size).map(|sector| hmac_sha1.compute(sector)).collect()
         } else if let Some(secure_area) = stored_secure_area {
             if secure_area.sector_digests.len() != num_secure_sectors {
                 return WrongSecureAreaDigestCountSnafu {
@@ -539,21 +538,16 @@ impl<'a> Dsi<'a> {
                 }
                 .fail();
             }
-            sector_digests[..num_secure_sectors].copy_from_slice(&secure_area.sector_digests);
-        }
-        for sector in rom[table_range(&layout.digest_dsi_area)].chunks(sector_size) {
-            sector_digests.push(hmac_sha1.compute(sector));
-        }
-        sector_digests.resize(layout.digest_sector_hashtable.size as usize / DIGEST_SIZE, [0; DIGEST_SIZE]);
-        let sector_hashtable = sector_digests.concat();
-
-        // --------------------- Block digests ---------------------
-        let block_size = self.config.digest_sector_count as usize * DIGEST_SIZE;
-        let block_hashtable =
-            sector_hashtable.chunks(block_size).map(|block| hmac_sha1.compute(block)).collect::<Vec<_>>().concat();
-
-        rom[table_range(&layout.digest_sector_hashtable)].copy_from_slice(&sector_hashtable);
-        rom[table_range(&layout.digest_block_hashtable)].copy_from_slice(&block_hashtable);
+            secure_area.sector_digests.clone()
+        } else {
+            vec![]
+        };
+        let params =
+            DigestParams { sector_size: self.config.digest_sector_size, block_sector_count: self.config.digest_sector_count };
+        let regions = [table_region(&layout.digest_ds_area), table_region(&layout.digest_dsi_area)];
+        let digest = Digest::compute(hmac_sha1, &params, rom, &regions, &secure_sectors)?;
+        rom[table_range(&layout.digest_sector_hashtable)].copy_from_slice(digest.sector_hashtable());
+        rom[table_range(&layout.digest_block_hashtable)].copy_from_slice(digest.block_hashtable());
 
         // --------------------- SHA1-HMACs ---------------------
         let (secure_area_crc, sha1_hmac_arm9_with_secure_area) = if let Some(secure_area) = &encrypted_secure_area {
@@ -580,7 +574,7 @@ impl<'a> Dsi<'a> {
             secure_area_crc,
             sha1_hmac_arm9_with_secure_area,
             sha1_hmac_arm7,
-            sha1_hmac_digest: hmac_sha1.compute(&block_hashtable),
+            sha1_hmac_digest: *digest.master(),
             sha1_hmac_banner: hmac_sha1.compute(&rom[table_range(&banner)]),
             sha1_hmac_arm9i,
             sha1_hmac_arm7i: hmac_sha1.compute(&self.arm7i),
@@ -659,6 +653,10 @@ fn program_range(program: &ProgramOffset) -> Range<usize> {
     program.offset as usize..program.offset as usize + program.size as usize
 }
 
+fn table_region(table: &TableOffset) -> Range<u32> {
+    table.offset..table.offset + table.size
+}
+
 fn table_range(table: &TableOffset) -> Range<usize> {
     table.offset as usize..table.offset as usize + table.size as usize
 }
@@ -708,7 +706,7 @@ fn to_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-fn from_hex(string: &str) -> Result<Digest, String> {
+fn from_hex(string: &str) -> Result<DigestHash, String> {
     if string.len() != DIGEST_SIZE * 2 {
         return Err(format!("expected {} hex digits but got {}", DIGEST_SIZE * 2, string.len()));
     }
@@ -722,11 +720,11 @@ fn from_hex(string: &str) -> Result<Digest, String> {
 mod hex_digest {
     use super::*;
 
-    pub fn serialize<S: Serializer>(digest: &Digest, serializer: S) -> Result<S::Ok, S::Error> {
+    pub fn serialize<S: Serializer>(digest: &DigestHash, serializer: S) -> Result<S::Ok, S::Error> {
         serializer.serialize_str(&to_hex(digest))
     }
 
-    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Digest, D::Error> {
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<DigestHash, D::Error> {
         from_hex(&String::deserialize(deserializer)?).map_err(D::Error::custom)
     }
 }
@@ -734,11 +732,11 @@ mod hex_digest {
 mod hex_digests {
     use super::*;
 
-    pub fn serialize<S: Serializer>(digests: &[Digest], serializer: S) -> Result<S::Ok, S::Error> {
+    pub fn serialize<S: Serializer>(digests: &[DigestHash], serializer: S) -> Result<S::Ok, S::Error> {
         serializer.collect_seq(digests.iter().map(|digest| to_hex(digest)))
     }
 
-    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<Digest>, D::Error> {
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<DigestHash>, D::Error> {
         Vec::<String>::deserialize(deserializer)?.iter().map(|s| from_hex(s).map_err(D::Error::custom)).collect()
     }
 }
