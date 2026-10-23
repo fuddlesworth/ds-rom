@@ -394,8 +394,9 @@ pub struct OverlayConfig {
 pub struct OverlayTableConfig {
     /// Whether the overlay table has an HMAC-SHA1 signature.
     pub table_signed: bool,
-    /// Overlay table HMAC-SHA1 signature. NOTE: This field is temporary! A bug in the DS standard library causes this
-    /// signature to be computed incorrectly, and we haven't replicated this bug in our code yet.
+    /// Overlay table HMAC-SHA1 signature to use as it is, in place of the one computed when the ROM is built. The
+    /// table is signed with NitroSDK's masked SHA-1 (see [`crate::crypto::hmac_sha1::sha1_masked`]), so a built table
+    /// normally needs none.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub table_signature: Option<HmacSha1Signature>,
     /// List of overlays.

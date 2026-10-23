@@ -23,10 +23,11 @@ impl<'a> OverlayTable<'a> {
         self.overlays.as_ref()
     }
 
-    /// Computes the HMAC-SHA1 signature of this overlay table using the given HMAC-SHA1 instance.
+    /// Computes the HMAC-SHA1 signature of this overlay table using the given HMAC-SHA1 instance. NitroSDK's tools sign
+    /// the table with the masked SHA-1 that leaves out its file IDs, see [`HmacSha1::compute_masked`].
     pub fn compute_signature(&self, hmac_sha1: &HmacSha1) -> HmacSha1Signature {
         let bytes = bytemuck::cast_slice(&self.overlays);
-        HmacSha1Signature::from_hmac_sha1(hmac_sha1, bytes)
+        HmacSha1Signature::from_hmac_sha1_masked(hmac_sha1, bytes)
     }
 
     /// Verifies the HMAC-SHA1 signature of this overlay table using the given HMAC-SHA1 instance.

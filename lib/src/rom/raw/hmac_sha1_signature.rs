@@ -42,6 +42,12 @@ impl HmacSha1Signature {
         Self { hash }
     }
 
+    /// Creates a new [`HmacSha1Signature`] from the masked HMAC-SHA1 of the given data, see [`HmacSha1::compute_masked`].
+    pub fn from_hmac_sha1_masked(hmac_sha1: &HmacSha1, data: &[u8]) -> Self {
+        let hash = hmac_sha1.compute_masked(data);
+        Self { hash }
+    }
+
     /// Sets the hash to the given value.
     pub fn set(&mut self, hash: [u8; 20]) {
         self.hash = hash;
