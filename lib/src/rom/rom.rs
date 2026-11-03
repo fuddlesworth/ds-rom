@@ -965,7 +965,21 @@ impl<'a> Rom<'a> {
     ///
     /// This function will return an error if an I/O operation fails or a component fails to build, or if a DSi ROM is
     /// incomplete or lacks its ARM9 HMAC-SHA1 key.
-    pub fn build(mut self, key: Option<&BlowfishKey>) -> Result<raw::Rom<'a>, RomBuildError> {
+    pub fn build(self, key: Option<&BlowfishKey>) -> Result<raw::Rom<'a>, RomBuildError> {
+        self.build_with(key, false)
+    }
+
+    /// Builds a raw ROM like [`Rom::build`]. If `allow_stale_secure_area` is true, a DSi ROM whose ARM9 secure area
+    /// changed since extracting builds without the Blowfish key, keeping the stale secure area values.
+    ///
+    /// # Errors
+    ///
+    /// See [`Rom::build`].
+    pub fn build_with(
+        mut self,
+        key: Option<&BlowfishKey>,
+        allow_stale_secure_area: bool,
+    ) -> Result<raw::Rom<'a>, RomBuildError> {
         match (&self.header.dsi, &self.dsi) {
             (Some(_), None) => return DsiIncompleteSnafu { present: "header's DSi section" }.fail(),
             (None, Some(_)) => return DsiIncompleteSnafu { present: "DSi area" }.fail(),
@@ -973,7 +987,7 @@ impl<'a> Rom<'a> {
             _ => {}
         }
 
-        let mut context = BuildContext { blowfish_key: key, ..Default::default() };
+        let mut context = BuildContext { blowfish_key: key, allow_stale_secure_area, ..Default::default() };
 
         let mut cursor = Cursor::new(Vec::with_capacity(128 * 1024)); // smallest possible ROM
 
@@ -1129,6 +1143,7 @@ impl<'a> Rom<'a> {
                 self.header.original.gamecode.0,
                 self.hmac_sha1.as_ref(),
                 context.blowfish_key,
+                context.allow_stale_secure_area,
             )?);
         }
 
@@ -1274,6 +1289,8 @@ pub struct BuildContext<'a> {
     pub banner_offset: Option<TableOffset>,
     /// Blowfish key.
     pub blowfish_key: Option<&'a BlowfishKey>,
+    /// Whether a changed ARM9 secure area may keep its stale secure area values, see [`Rom::build_with`].
+    pub allow_stale_secure_area: bool,
     /// ARM9 autoload callback.
     pub arm9_autoload_callback: Option<u32>,
     /// ARM7 autoload callback.

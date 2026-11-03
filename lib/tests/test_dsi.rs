@@ -241,6 +241,21 @@ fn test_dsi_hashes_are_regenerated() -> Result<()> {
             Err(RomBuildError::Dsi { source: DsiError::SecureAreaChanged { .. } }) => {
                 assert!(secure_area(&modified)? != secure_area(&original)?, "{file_name}: secure area changed falsely");
                 println!("{file_name}: building without the key failed, as the secure area changed");
+
+                // Allowing stale values builds the new secure area, but keeps the values extracted from the original ROM
+                let rom = Rom::load(extract_path.join("config.yaml"), RomLoadOptions::default())?;
+                let stale = rom.build_with(None, true)?;
+                assert!(
+                    secure_area(stale.data())? == secure_area(&modified)?,
+                    "{file_name}: stale build lost the new secure area"
+                );
+                let arm9_hash =
+                    |rom: &[u8]| -> Result<[u8; 20]> { Ok(raw::Rom::new(rom).header()?.sha1_hmac_arm9_with_secure_area) };
+                assert_eq!(
+                    arm9_hash(stale.data())?,
+                    arm9_hash(&original)?,
+                    "{file_name}: stale build recomputed the ARM9 hash"
+                );
             }
             Err(error) => return Err(error.into()),
             Ok(rom) => {

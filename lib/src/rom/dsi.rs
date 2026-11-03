@@ -506,7 +506,7 @@ impl<'a> Dsi<'a> {
     /// # Errors
     ///
     /// This function will return an error if the HMAC-SHA1 key is missing, or if the secure area values are needed but
-    /// missing.
+    /// missing, or if they are stale and `allow_stale_secure_area` is false.
     #[allow(clippy::too_many_arguments)]
     pub fn finalize(
         &self,
@@ -519,6 +519,7 @@ impl<'a> Dsi<'a> {
         gamecode: [u8; 4],
         hmac_sha1: Option<&HmacSha1>,
         blowfish_key: Option<&BlowfishKey>,
+        allow_stale_secure_area: bool,
     ) -> Result<DsiHeaderValues, DsiError> {
         let Some(hmac_sha1) = hmac_sha1 else {
             return NoHmacSha1KeySnafu {}.fail();
@@ -544,7 +545,13 @@ impl<'a> Dsi<'a> {
         if let Some(plaintext_sha1) = stored_secure_area.and_then(|values| values.plaintext_sha1)
             && secure_area_sha1(arm9_data) != plaintext_sha1
         {
-            return SecureAreaChangedSnafu {}.fail();
+            if !allow_stale_secure_area {
+                return SecureAreaChangedSnafu {}.fail();
+            }
+            log::warn!(
+                "the ARM9 secure area changed since extracting; keeping the stale secure area values, so the DSi \
+                 digests and SHA1-HMACs derived from it no longer match the ARM9 program"
+            );
         }
 
         // --------------------- Digests ---------------------
